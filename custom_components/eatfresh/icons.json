@@ -17,6 +17,18 @@
     },
     "add_recipe_to_shopping_list": {
       "service": "mdi:cart-plus"
+    },
+    "search_collection": {
+      "service": "mdi:book-search"
+    },
+    "get_planner": {
+      "service": "mdi:calendar-search"
+    },
+    "plan_recipe": {
+      "service": "mdi:calendar-plus"
+    },
+    "unplan_recipe": {
+      "service": "mdi:calendar-remove"
     }
   }
 }

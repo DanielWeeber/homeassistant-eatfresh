@@ -19,11 +19,16 @@ from .categories import canonical_category, category_names, suggest_categories
 from .const import (
     CHEFKOCH,
     CONF_ACCEPT_CHEFKOCH,
+    CONF_PLANNER_INTERVAL,
     CONF_SOURCES,
+    DEFAULT_PLANNER_INTERVAL,
+    DEFAULT_COLLECTION_LIMIT,
     DOMAIN,
     JSONLD,
+    MAX_PLANNER_INTERVAL,
     MAX_TAG_LENGTH,
     MAX_TAGS,
+    MIN_PLANNER_INTERVAL,
     PLANNER_MAX_AGE,
     RECIPE_CACHE_TTL,
     SEARCH_CACHE_TTL,
@@ -126,6 +131,46 @@ def planner_date(entry: Mapping[str, Any]) -> date | None:
     return None
 
 
+def dated_entries(
+    entries: Iterable[Mapping[str, Any]] | None, first: date, days: int
+) -> list[tuple[date, dict[str, Any]]]:
+    """Return ``(day, entry)`` for the entries from ``first`` on ``days`` days.
+
+    Sorted by day; entries of the same day keep the order of KitchenOwl.
+    Entries without a recipe id or without a day are left out.
+    """
+    end = first + timedelta(days=days)
+    result: list[tuple[date, dict[str, Any]]] = []
+    for entry in entries or []:
+        if not isinstance(entry.get("recipe_id"), int):
+            continue
+        day = planner_date(entry)
+        if day is not None and first <= day < end:
+            result.append((day, dict(entry)))
+    result.sort(key=lambda item: item[0])
+    return result
+
+
+def unscheduled_entries(
+    entries: Iterable[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return the entries planned without a day (not those with a broken day)."""
+    return [
+        dict(entry)
+        for entry in entries or []
+        if isinstance(entry.get("recipe_id"), int) and entry.get("date") in (None, "")
+    ]
+
+
+def plan_item(day: date, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``{date, recipe_id, name}`` of a meal plan entry (actions, sensor)."""
+    return {
+        "date": day.isoformat(),
+        "recipe_id": entry["recipe_id"],
+        "name": str(entry.get("name") or ""),
+    }
+
+
 def build_week(entries: Iterable[Mapping[str, Any]], week_start: date) -> PlannerWeek:
     """Sort meal plan entries into the 7 days of a week and the undated ones."""
     start = week_start_of(week_start)
@@ -133,19 +178,26 @@ def build_week(entries: Iterable[Mapping[str, Any]], week_start: date) -> Planne
         (start + timedelta(days=offset), []) for offset in range(7)
     ]
     by_day = {day: items for day, items in days}
-    unscheduled: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry.get("recipe_id"), int):
-            continue
-        item = dict(entry)
-        day = planner_date(entry)
-        if day is None:
-            if entry.get("date") in (None, ""):
-                unscheduled.append(item)
-            continue
-        if day in by_day:
-            by_day[day].append(item)
-    return PlannerWeek(week_start=start, days=days, unscheduled=unscheduled)
+    entries = list(entries)
+    for day, item in dated_entries(entries, start, 7):
+        by_day[day].append(item)
+    return PlannerWeek(
+        week_start=start, days=days, unscheduled=unscheduled_entries(entries)
+    )
+
+
+def planner_interval(options: Mapping[str, Any]) -> timedelta:
+    """Return the time between two fetches of the meal plan.
+
+    Entries set up with 0.2.0 or earlier have no such option and get the
+    default (one minute). Values outside 1 to 60 minutes are moved into it.
+    """
+    try:
+        minutes = int(options.get(CONF_PLANNER_INTERVAL, DEFAULT_PLANNER_INTERVAL))
+    except (TypeError, ValueError):
+        minutes = DEFAULT_PLANNER_INTERVAL
+    minutes = min(max(minutes, MIN_PLANNER_INTERVAL), MAX_PLANNER_INTERVAL)
+    return timedelta(minutes=minutes)
 
 
 def clean_tags(tags: Iterable[str]) -> list[str]:
@@ -206,6 +258,9 @@ class EatFreshData:
     # week at the same time send them only once; the second one is asked.
     _week_locks: dict[date, asyncio.Lock] = field(default_factory=dict)
     _week_users: dict[date, int] = field(default_factory=dict)
+    # The fetch of the meal plan that callers of
+    # ``async_current_planner_entries`` share while it runs.
+    _planner_fetch: asyncio.Task[list[dict[str, Any]]] | None = None
 
     # ----- images -------------------------------------------------------
 
@@ -543,6 +598,57 @@ class EatFreshData:
             recipes.append({**recipe, "tags": tags, "hidden": hidden})
         return recipes
 
+    async def async_search_collection(
+        self, query: str | None, limit: int = DEFAULT_COLLECTION_LIMIT
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return the visible recipes of the collection whose name or an
+        ingredient contains ``query`` (any case), each with its planned days,
+        and the number of all matches.
+
+        Without ``query`` the whole visible collection matches. At most
+        ``limit`` recipes come back. The days come from the plan of the last
+        ``PLANNER_MAX_AGE`` if there is one. If only the plan cannot be
+        loaded, the recipes come back without days.
+        """
+        needle = (query or "").strip().casefold()
+        recipes = await self.async_collection()
+        if needle:
+            recipes = [
+                recipe
+                for recipe in recipes
+                if needle in str(recipe.get("name") or "").casefold()
+                or any(
+                    needle in str(item).casefold() for item in recipe.get("items") or []
+                )
+            ]
+        total = len(recipes)
+        recipes = recipes[: max(limit, 0)]
+        if not recipes:
+            return [], total
+        try:
+            entries = await self.async_current_planner_entries()
+        except KitchenOwlAuthError:
+            raise
+        except EatFreshError as err:
+            _LOGGER.debug("Meal plan not available for the search: %s", err)
+            entries = []
+        planned: dict[int, set[str]] = {}
+        for entry in entries:
+            day = planner_date(entry)
+            if day is not None and isinstance(entry.get("recipe_id"), int):
+                planned.setdefault(entry["recipe_id"], set()).add(day.isoformat())
+        return [
+            {
+                "recipe_id": recipe["id"],
+                "name": recipe.get("name"),
+                "time": recipe.get("time"),
+                "yields": recipe.get("yields"),
+                "tags": list(recipe.get("tags") or []),
+                "planned_dates": sorted(planned.get(recipe["id"], ())),
+            }
+            for recipe in recipes
+        ], total
+
     async def async_collection_recipe(self, kitchenowl_id: int) -> Recipe:
         """Return a recipe as stored in KitchenOwl. No recipe page is fetched."""
         await self.async_require_own([kitchenowl_id])
@@ -597,6 +703,29 @@ class EatFreshData:
             self.coordinator.async_set_updated_data(entries)
         return entries
 
+    async def async_current_planner_entries(self) -> list[dict[str, Any]]:
+        """Return the plan of the coordinator while it is younger than
+        ``PLANNER_MAX_AGE``, else fetch it (and share it with the entities).
+        """
+        if self.coordinator is not None:
+            cached = self.coordinator.fresh_data(PLANNER_MAX_AGE)
+            if cached is not None:
+                return cached
+        # Many callers at once (cards, scripts) share one running fetch.
+        if (task := self._planner_fetch) is None or task.done():
+            task = self._planner_fetch = asyncio.ensure_future(
+                self.async_planner_entries()
+            )
+            task.add_done_callback(self._planner_fetch_done)
+        return await asyncio.shield(task)
+
+    def _planner_fetch_done(self, task: asyncio.Task[Any]) -> None:
+        """Forget the finished shared fetch (its error is read by a caller)."""
+        if self._planner_fetch is task:
+            self._planner_fetch = None
+        if not task.cancelled():
+            task.exception()
+
     async def async_planner_week(
         self, week_start: date | None, *, use_cache: bool = True
     ) -> PlannerWeek:
@@ -608,11 +737,10 @@ class EatFreshData:
         """
         day = week_start or today()
         current = week_start_of(day) == week_start_of(today())
-        if use_cache and current and self.coordinator is not None:
-            cached = self.coordinator.fresh_data(PLANNER_MAX_AGE)
-            if cached is not None:
-                return build_week(cached, day)
-        entries = await self.async_planner_entries()
+        if use_cache and current:
+            entries = await self.async_current_planner_entries()
+        else:
+            entries = await self.async_planner_entries()
         return build_week(entries, day)
 
     async def async_planner_add(self, kitchenowl_id: int, day: date) -> None:

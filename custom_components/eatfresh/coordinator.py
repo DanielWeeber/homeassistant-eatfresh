@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN, PLANNER_UPDATE_INTERVAL
+from .const import DOMAIN
 from .errors import KitchenOwlAuthError, KitchenOwlError
 
 if TYPE_CHECKING:
@@ -25,7 +25,13 @@ type PlannerEntries = list[dict[str, Any]]
 
 
 class PlannerCoordinator(DataUpdateCoordinator[PlannerEntries]):
-    """Fetch the meal plan every 15 minutes and after each change in EatFresh."""
+    """Fetch the meal plan regularly and after each change in EatFresh.
+
+    The interval comes from the options (default: every minute). Each update
+    is one request to KitchenOwl (``list_planner``). A plan fetched elsewhere
+    by EatFresh (``async_set_updated_data``) counts as an update and moves the
+    next one back by a whole interval, so the two never add up.
+    """
 
     def __init__(
         self,
@@ -33,6 +39,7 @@ class PlannerCoordinator(DataUpdateCoordinator[PlannerEntries]):
         entry: ConfigEntry,
         client: KitchenOwlClient,
         household_id: int,
+        update_interval: timedelta,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -40,7 +47,7 @@ class PlannerCoordinator(DataUpdateCoordinator[PlannerEntries]):
             _LOGGER,
             config_entry=entry,
             name=f"{DOMAIN} meal plan",
-            update_interval=PLANNER_UPDATE_INTERVAL,
+            update_interval=update_interval,
         )
         self.client = client
         self.household_id = household_id

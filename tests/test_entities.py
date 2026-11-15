@@ -233,11 +233,12 @@ async def test_unreachable_kitchenowl_makes_entities_unavailable(
     assert hass.states.get(SENSOR).state == "Soup"
 
 
-async def test_plan_is_fetched_every_15_minutes(
+async def test_plan_is_fetched_every_minute(
     hass: HomeAssistant, init_integration: MockConfigEntry, mock_client: MagicMock
 ) -> None:
+    """Default since 0.3.0 (before: every 15 minutes)."""
     before = mock_client.list_planner.await_count
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=16))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
     await hass.async_block_till_done()
     assert mock_client.list_planner.await_count == before + 1
 

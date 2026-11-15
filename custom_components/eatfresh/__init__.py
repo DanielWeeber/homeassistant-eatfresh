@@ -27,7 +27,12 @@ from .errors import KitchenOwlAuthError, KitchenOwlError
 from .http import HttpClient, create_public_session
 from .image_proxy import EatFreshImageView
 from .kitchenowl import KitchenOwlClient
-from .runtime import EatFreshConfigEntry, EatFreshData, enabled_source_ids
+from .runtime import (
+    EatFreshConfigEntry,
+    EatFreshData,
+    enabled_source_ids,
+    planner_interval,
+)
 from .services import async_register_services
 from .sources import SOURCE_CLASSES, blocked_hosts, build_sources
 from .store import FavoritesStore
@@ -96,7 +101,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EatFreshConfigEntry) -> 
     await store.async_load()
 
     household_id = int(entry.data[CONF_HOUSEHOLD_ID])
-    coordinator = PlannerCoordinator(hass, entry, client, household_id)
+    coordinator = PlannerCoordinator(
+        hass, entry, client, household_id, planner_interval(entry.options)
+    )
     # Not the first-refresh helper: an unreachable meal plan only makes the
     # entities unavailable, the panel keeps working. A rejected token still
     # starts the reauthentication.

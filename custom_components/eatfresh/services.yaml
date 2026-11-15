@@ -16,3 +16,67 @@ add_recipe_to_shopping_list:
         number:
           min: 1
           mode: box
+
+search_collection:
+  fields:
+    query:
+      required: false
+      example: "pasta"
+      selector:
+        text:
+    limit:
+      required: false
+      default: 50
+      example: 10
+      selector:
+        number:
+          min: 1
+          max: 200
+          mode: box
+
+get_planner:
+  fields:
+    start_date:
+      required: false
+      example: "2026-11-16"
+      selector:
+        date:
+    days:
+      required: false
+      default: 7
+      example: 7
+      selector:
+        number:
+          min: 1
+          max: 31
+          mode: box
+
+plan_recipe:
+  fields:
+    recipe_id:
+      required: true
+      example: 42
+      selector:
+        number:
+          min: 1
+          mode: box
+    date:
+      required: true
+      example: "2026-11-16"
+      selector:
+        date:
+
+unplan_recipe:
+  fields:
+    recipe_id:
+      required: true
+      example: 42
+      selector:
+        number:
+          min: 1
+          mode: box
+    date:
+      required: false
+      example: "2026-11-16"
+      selector:
+        date:

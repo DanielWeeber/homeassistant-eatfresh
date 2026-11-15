@@ -205,6 +205,8 @@ async def test_options_default_and_save(
     assert init_integration.options == {
         CONF_SOURCES: ["fakeb"],
         CONF_ACCEPT_CHEFKOCH: False,
+        # Not in the form input: the default of the form (one minute).
+        "planner_interval": 1,
     }
     await hass.async_block_till_done()
     assert set(init_integration.runtime_data.sources) == {"fakeb", "jsonld"}

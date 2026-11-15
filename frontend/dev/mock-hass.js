@@ -2,6 +2,8 @@
 // URL options: ?theme=dark  ?lang=en  ?delay=600
 //   ?fail=favorite,unfavorite,shopping,collection,search,recipe,sources,
 //         korecipe,hide,unhide,tags,set_tags,planner,plan,unplan,week_shopping
+//   A link to https://rezepte.example.com/emmi/eintopf is already in the collection (id 102).
+//   ?failonce=favorite (the named calls fail the first time only, like a short outage)
 //   ?empty=collection,planner
 //   ?today=YYYY-MM-DD (today of Home Assistant, default: the browser's day)
 // The source "Küchengötter" always reports an error in the search, to show the banner.
@@ -21,6 +23,7 @@ const mondayOf = (s) => plusDays(s, -((parse(s).getDay() + 6) % 7));
 
 export function createMock(params = new URLSearchParams(location.search)) {
   const fail = new Set((params.get("fail") ?? "").split(",").filter(Boolean));
+  const failOnce = new Set((params.get("failonce") ?? "").split(",").filter(Boolean));
   const empty = new Set((params.get("empty") ?? "").split(",").filter(Boolean));
   const delay = Number(params.get("delay") ?? 350);
   const dark = params.get("theme") === "dark";
@@ -165,6 +168,13 @@ export function createMock(params = new URLSearchParams(location.search)) {
     },
     "eatfresh/favorite": ({ key }) => {
       if (fail.has("favorite")) throw wsError("kitchenowl_error", "Mock: KitchenOwl down");
+      if (failOnce.delete("favorite")) throw wsError("kitchenowl_error", "Mock: KitchenOwl down");
+      // Like the core: look in the store, then for a recipe with the same source link.
+      if (!favorites.has(key)) {
+        const known = hits.find((h) => h.key === key);
+        const same = known && collection.find((c) => c.source === known.url);
+        if (same) favorites.set(key, same.kitchenowl_id);
+      }
       if (favorites.has(key)) {
         const r = byId(favorites.get(key));
         if (r) r.hidden = false;

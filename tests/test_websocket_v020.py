@@ -100,6 +100,34 @@ async def test_hidden_favorite_is_no_favorite_until_new_heart(
     assert mock_client.create_recipe.await_count == 1
 
 
+async def test_undo_of_automatic_save_ends_in_a_consistent_state(
+    ws: WS, init_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """The panel's "Undo": heart off, then hide. A later heart shows it again."""
+    store = init_integration.runtime_data.store
+    msg = await ws.call("eatfresh/favorite", key="fakea:r1")
+    assert msg["result"] == {"kitchenowl_id": 42, "created": True, "tags": []}
+
+    # Undo, in the order of the panel: unfavorite, then hide.
+    assert (await ws.call("eatfresh/unfavorite", key="fakea:r1"))["result"] == {}
+    assert (await ws.call("eatfresh/collection/hide", kitchenowl_id=42))["result"] == {}
+    assert store.is_hidden(42)
+    assert store.get("fakea:r1") is None
+    msg = await ws.call("eatfresh/recipe", key="fakea:r1")
+    assert msg["result"]["favorite"] is False
+    assert msg["result"]["kitchenowl_id"] is None
+    assert (await ws.call("eatfresh/favorites"))["result"]["favorites"] == []
+    mock_client.delete_recipe.assert_not_called()
+
+    # The recipe is still in KitchenOwl: a new heart finds it and shows it again.
+    mock_client.find_by_source.return_value = 42
+    msg = await ws.call("eatfresh/favorite", key="fakea:r1")
+    assert msg["result"]["kitchenowl_id"] == 42
+    assert msg["result"]["created"] is False
+    assert not store.is_hidden(42)
+    assert mock_client.create_recipe.await_count == 1
+
+
 async def test_heart_on_hidden_recipe_found_in_kitchenowl(
     ws: WS, init_integration: MockConfigEntry, mock_client: MagicMock
 ) -> None:

@@ -7,6 +7,12 @@ addresses go through ``open_public_url``: names are resolved, private networks
 are refused and every redirect is checked again, also against the allowed
 hosts. At most ``MAX_PARALLEL_FETCHES`` remote images are fetched at a time,
 because each one is buffered in memory.
+
+A signed path is reused while it stays valid for at least
+``IMAGE_SIGN_RENEW_BEFORE``. So the sensor attribute and the answers for the
+panel keep the same address for the same photo (no new state every minute,
+the browser cache keeps working), and a new one comes shortly before the old
+one runs out.
 """
 
 from __future__ import annotations
@@ -14,11 +20,16 @@ from __future__ import annotations
 import asyncio
 from http import HTTPStatus
 import logging
+import time
 
 import aiohttp
 from aiohttp import web
+from homeassistant.components import websocket_api
 from homeassistant.components.http import KEY_HASS, HomeAssistantView
-from homeassistant.components.http.auth import async_sign_path
+from homeassistant.components.http.auth import STORAGE_KEY, async_sign_path
+from homeassistant.components.http.const import KEY_HASS_REFRESH_TOKEN_ID
+from homeassistant.helpers.http import current_request
+from homeassistant.util.hass_dict import HassKey
 from homeassistant.core import HomeAssistant, callback
 from yarl import URL
 
@@ -27,6 +38,7 @@ from .const import (
     IMAGE_MAX_BYTES,
     IMAGE_PROXY_PATH,
     IMAGE_SIGN_EXPIRATION,
+    IMAGE_SIGN_RENEW_BEFORE,
     USER_AGENT,
 )
 from .errors import EatFreshError
@@ -42,8 +54,18 @@ ALLOWED_CONTENT_TYPES = frozenset(
 )
 
 
+# Signed paths by (signing token, path): (signed path, expiry as Unix time).
+DATA_SIGNED: HassKey[dict[tuple[str, str], tuple[str, int]]] = HassKey(
+    "eatfresh_signed_images"
+)
+# Upper bound for the reuse table; expired entries are dropped first.
+MAX_SIGNED_PATHS = 2000
+
+
 @callback
-def sign_image_url(hass: HomeAssistant, url: str | None) -> str | None:
+def sign_image_url(
+    hass: HomeAssistant, url: str | None, *, content_user: bool = False
+) -> str | None:
     """Return a signed proxy path for a remote image or None."""
     if not url:
         return None
@@ -51,16 +73,59 @@ def sign_image_url(hass: HomeAssistant, url: str | None) -> str | None:
     if parsed.scheme not in ("http", "https") or not parsed.host:
         return None
     path = URL(IMAGE_PROXY_PATH).with_query(url=url)
-    return async_sign_path(hass, str(path), IMAGE_SIGN_EXPIRATION)
+    return _signed(hass, str(path), content_user)
 
 
 @callback
-def sign_photo(hass: HomeAssistant, filename: str | None) -> str | None:
-    """Return a signed proxy path for a KitchenOwl photo or None."""
+def sign_photo(
+    hass: HomeAssistant, filename: str | None, *, content_user: bool = False
+) -> str | None:
+    """Return a signed proxy path for a KitchenOwl photo or None.
+
+    ``content_user`` signs for Home Assistant's content user instead of the
+    caller. Entity attributes use it: they outlive a single connection.
+    """
     if not filename or not _valid_photo_name(filename):
         return None
     path = URL(IMAGE_PROXY_PATH).with_query(photo=filename)
-    return async_sign_path(hass, str(path), IMAGE_SIGN_EXPIRATION)
+    return _signed(hass, str(path), content_user)
+
+
+def _signing_token(hass: HomeAssistant, content_user: bool) -> str:
+    """Return the refresh token id ``async_sign_path`` would sign for."""
+    if not content_user:
+        if (
+            connection := websocket_api.current_connection.get()
+        ) and connection.refresh_token_id:
+            return connection.refresh_token_id
+        if (request := current_request.get()) is not None and (
+            KEY_HASS_REFRESH_TOKEN_ID in request
+        ):
+            return request[KEY_HASS_REFRESH_TOKEN_ID]
+    return hass.data[STORAGE_KEY]
+
+
+@callback
+def _signed(hass: HomeAssistant, path: str, content_user: bool) -> str:
+    """Return a signed path, reusing one that is still valid long enough."""
+    token = _signing_token(hass, content_user)
+    cache = hass.data.setdefault(DATA_SIGNED, {})
+    now = time.time()
+    key = (token, path)
+    if (hit := cache.get(key)) is not None and (
+        hit[1] - now > IMAGE_SIGN_RENEW_BEFORE.total_seconds()
+    ):
+        return hit[0]
+    signed = async_sign_path(
+        hass, path, IMAGE_SIGN_EXPIRATION, refresh_token_id=token
+    )
+    if len(cache) >= MAX_SIGNED_PATHS:
+        for old in [k for k, (_s, exp) in cache.items() if exp <= now]:
+            del cache[old]
+        if len(cache) >= MAX_SIGNED_PATHS:
+            cache.clear()
+    cache[key] = (signed, int(now + IMAGE_SIGN_EXPIRATION.total_seconds()))
+    return signed
 
 
 def _valid_photo_name(filename: str) -> bool:

@@ -10,9 +10,16 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_change
 
+from .const import WEEK_DAYS
 from .entity import EatFreshEntity
 from .image_proxy import sign_photo
-from .runtime import EatFreshConfigEntry, planner_date, today
+from .runtime import (
+    EatFreshConfigEntry,
+    dated_entries,
+    plan_item,
+    planner_date,
+    today,
+)
 
 PARALLEL_UPDATES = 0
 
@@ -41,14 +48,26 @@ def todays_entries(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]
     ]
 
 
-class EatFreshTodaySensor(EatFreshEntity, SensorEntity):
-    """Names of today's meals, or unknown when nothing is planned."""
+def week_entries(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Return ``{date, recipe_id, name}`` from today to six days on, by day."""
+    return [
+        plan_item(day, entry)
+        for day, entry in dated_entries(entries, today(), WEEK_DAYS)
+    ]
 
-    # The signed image paths change with every update; keep them out of history.
+
+class EatFreshTodaySensor(EatFreshEntity, SensorEntity):
+    """Names of today's meals, or unknown when nothing is planned.
+
+    The attribute ``week`` lists the meals of today and the next six days, so
+    a script or an assistant can read them without asking the calendar.
+    """
+
+    # The signed image paths change twice a day; keep them out of history.
     _unrecorded_attributes = frozenset({"recipes"})
 
     async def async_added_to_hass(self) -> None:
-        """Update the state shortly after midnight as well."""
+        """Update the state (and ``week``) shortly after midnight as well."""
         await super().async_added_to_hass()
         self.async_on_remove(
             async_track_time_change(
@@ -75,14 +94,17 @@ class EatFreshTodaySensor(EatFreshEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the recipes of today with KitchenOwl id, name and image."""
+        """Return today's recipes (id, name, image) and the plan of the week."""
         return {
+            "week": week_entries(self.coordinator.data),
             "recipes": [
                 {
                     "kitchenowl_id": entry["recipe_id"],
                     "name": entry.get("name"),
-                    "image": sign_photo(self.hass, entry.get("photo")),
+                    "image": sign_photo(
+                        self.hass, entry.get("photo"), content_user=True
+                    ),
                 }
                 for entry in todays_entries(self.coordinator.data)
-            ]
+            ],
         }

@@ -147,7 +147,11 @@ async def test_list_recipes(client, mock):
                 "photo": "abc.jpg",
                 "time": 30,
                 "yields": 4,
-                "items": [],
+                "items": [
+                    {"id": 1, "name": "Mehl", "description": "500 g"},
+                    {"id": 2, "name": ""},
+                    "broken",
+                ],
                 "tags": [{"id": 2, "name": "Backen"}, {"id": 3, "name": "Süß"}],
             }
         ],
@@ -161,6 +165,7 @@ async def test_list_recipes(client, mock):
             "time": 30,
             "yields": 4,
             "tags": ["Backen", "Süß"],
+            "items": ["Mehl"],
         }
     ]
 

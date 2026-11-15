@@ -37,6 +37,9 @@ REQUEST_TIMEOUT = 20  # seconds
 # How long ``find_by_source`` may reuse the last list of recipes. Creating a
 # recipe through this client drops the copy at once.
 RECIPE_LIST_TTL = 120.0  # seconds
+# A "fresh" list of recipe ids may be this old, so repeated lookups of an
+# unknown id do not load the whole list again every time.
+RECIPE_LIST_FRESH_AGE = 5.0  # seconds
 _USER_AGENT = "EatFresh (Home Assistant integration)"
 
 # Units the KitchenOwl merger converts between (written without a space).
@@ -288,6 +291,17 @@ def _tag_names(raw: Any) -> list[str]:
     return _clean_tags([n for n in names if isinstance(n, str)])
 
 
+def _item_names(raw: Any) -> list[str]:
+    """Return the names of the items of a recipe (``[{name, ...}]``)."""
+    if not isinstance(raw, list):
+        return []
+    return [
+        name
+        for item in raw
+        if isinstance(item, dict) and isinstance(name := item.get("name"), str) and name
+    ]
+
+
 def _day_to_ms(day: date) -> int:
     """Return midnight UTC of ``day`` in milliseconds (KitchenOwl's format)."""
     midnight = datetime(day.year, day.month, day.day, tzinfo=UTC)
@@ -492,7 +506,8 @@ class KitchenOwlClient:
     async def list_recipes(self, household_id: int) -> list[dict]:
         """Return all recipes of a household, reduced to the fields we use.
 
-        Fields: id, name, source, photo, time, yields and ``tags`` (names).
+        Fields: id, name, source, photo, time, yields, ``tags`` (names) and
+        ``items`` (names of the ingredients, for the search of the collection).
         """
         path = f"/api/household/{int(household_id)}/recipe"
         data = self._expect(await self._request("GET", path), list, path)
@@ -505,16 +520,22 @@ class KitchenOwlClient:
                 "time": item.get("time"),
                 "yields": item.get("yields"),
                 "tags": _tag_names(item.get("tags")),
+                "items": _item_names(item.get("items")),
             }
             for item in data
         ]
         self._recipe_lists[int(household_id)] = (time.monotonic(), recipes)
-        return [{**item, "tags": list(item["tags"])} for item in recipes]
+        return [
+            {**item, "tags": list(item["tags"]), "items": list(item["items"])}
+            for item in recipes
+        ]
 
-    async def _cached_recipes(self, household_id: int) -> list[dict]:
-        """Return the recipe list, reusing a copy younger than RECIPE_LIST_TTL."""
+    async def _cached_recipes(
+        self, household_id: int, max_age: float = RECIPE_LIST_TTL
+    ) -> list[dict]:
+        """Return the recipe list, reusing a copy younger than ``max_age``."""
         cached = self._recipe_lists.get(int(household_id))
-        if cached is not None and time.monotonic() - cached[0] < RECIPE_LIST_TTL:
+        if cached is not None and time.monotonic() - cached[0] < max_age:
             return cached[1]
         return await self.list_recipes(household_id)
 
@@ -522,12 +543,11 @@ class KitchenOwlClient:
         """Return the ids of all recipes of a household.
 
         Reuses the recipe list for a short time (see ``RECIPE_LIST_TTL``);
-        with ``fresh`` it is always loaded again.
+        with ``fresh`` only a list younger than ``RECIPE_LIST_FRESH_AGE`` is
+        reused, so an unknown id loads the list at most every few seconds.
         """
-        recipes = (
-            await self.list_recipes(household_id)
-            if fresh
-            else await self._cached_recipes(household_id)
+        recipes = await self._cached_recipes(
+            household_id, RECIPE_LIST_FRESH_AGE if fresh else RECIPE_LIST_TTL
         )
         ids: set[int] = set()
         for recipe in recipes:

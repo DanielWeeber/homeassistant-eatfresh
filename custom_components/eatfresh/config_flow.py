@@ -16,6 +16,9 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -31,16 +34,19 @@ from .const import (
     CHEFKOCH,
     CONF_ACCEPT_CHEFKOCH,
     CONF_HOUSEHOLD_ID,
+    CONF_PLANNER_INTERVAL,
     CONF_SHOPPINGLIST_ID,
     CONF_SOURCES,
     CONF_TOKEN,
     CONF_URL,
     DOMAIN,
+    MAX_PLANNER_INTERVAL,
+    MIN_PLANNER_INTERVAL,
     NAME,
 )
 from .errors import KitchenOwlAuthError, KitchenOwlError
 from .kitchenowl import KitchenOwlClient
-from .runtime import enabled_source_ids
+from .runtime import enabled_source_ids, planner_interval
 from .sources import SOURCE_CLASSES
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,6 +54,15 @@ _LOGGER = logging.getLogger(__name__)
 EXAMPLE_URL = "https://kitchenowl.example.com"
 URL_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
 TOKEN_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+INTERVAL_SELECTOR = NumberSelector(
+    NumberSelectorConfig(
+        min=MIN_PLANNER_INTERVAL,
+        max=MAX_PLANNER_INTERVAL,
+        step=1,
+        mode=NumberSelectorMode.BOX,
+        unit_of_measurement="min",
+    )
+)
 
 
 def _normalize_url(value: str) -> str | None:
@@ -57,6 +72,11 @@ def _normalize_url(value: str) -> str | None:
     if parsed.scheme not in ("http", "https") or not parsed.host:
         return None
     return value
+
+
+def _minutes(options: Mapping[str, Any]) -> int:
+    """Return the meal plan interval of options (or of the form) in minutes."""
+    return int(planner_interval(options).total_seconds() // 60)
 
 
 def _options(items: list[dict[str, Any]]) -> list[SelectOptionDict]:
@@ -239,7 +259,7 @@ class EatFreshConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class EatFreshOptionsFlow(OptionsFlowWithReload):
-    """Choose the active recipe sources."""
+    """Choose the active recipe sources and the meal plan interval."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -252,17 +272,26 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
         if user_input is not None:
             selected = list(user_input.get(CONF_SOURCES, []))
             accepted = bool(user_input.get(CONF_ACCEPT_CHEFKOCH, False))
+            # Entries of 0.2.0 have no interval: the form shows the default.
+            interval = _minutes(
+                user_input if CONF_PLANNER_INTERVAL in user_input else options
+            )
             if CHEFKOCH in selected and not accepted:
                 errors[CONF_ACCEPT_CHEFKOCH] = "chefkoch_terms"
             else:
                 return self.async_create_entry(
-                    data={CONF_SOURCES: selected, CONF_ACCEPT_CHEFKOCH: accepted}
+                    data={
+                        CONF_SOURCES: selected,
+                        CONF_ACCEPT_CHEFKOCH: accepted,
+                        CONF_PLANNER_INTERVAL: interval,
+                    }
                 )
             current = selected
             current_accepted = accepted
         else:
             current = enabled_source_ids(options, SOURCE_CLASSES)
             current_accepted = bool(options.get(CONF_ACCEPT_CHEFKOCH, False))
+            interval = _minutes(options)
 
         schema = vol.Schema(
             {
@@ -279,6 +308,9 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
                 vol.Optional(
                     CONF_ACCEPT_CHEFKOCH, default=current_accepted
                 ): BooleanSelector(),
+                vol.Optional(
+                    CONF_PLANNER_INTERVAL, default=interval
+                ): INTERVAL_SELECTOR,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

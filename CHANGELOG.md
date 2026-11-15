@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-11-15)
+
+- New actions with a response, for scripts and voice assistants: `eatfresh.search_collection` (search the collection by name or ingredient, with the planned days), `eatfresh.get_planner` (meal plan from a day on 1 to 31 days, plus recipes without a day), `eatfresh.plan_recipe` and `eatfresh.unplan_recipe`. Only recipes of the own collection are accepted (`not_in_collection`); KitchenOwl errors and a rejected token behave as in the other actions. The calendar and the sensor are updated right after planning or removing.
+- The meal plan is fetched every minute instead of every 15 minutes, so a change made in the KitchenOwl app shows up after about a minute. The interval can be set in the options (1 to 60 minutes); existing setups get one minute. Each fetch is one request to KitchenOwl, and a plan loaded for the cards counts as the fetch of that minute.
+- Sensor "Today" has a new attribute `week`: the meals from today to six days ahead (`date`, `recipe_id`, `name`), sorted by date. It moves on shortly after midnight.
+- The recipe list from KitchenOwl now also keeps the names of the ingredients (used by the search of the collection).
+- Sensor "Today" no longer writes a new state every minute when a recipe with a photo is planned for today. A signed image address is reused until less than 12 of its 24 hours are left, so the state only changes with the plan (and at most twice a day for a new address). The sensor signs for Home Assistant's content user. The panel and the cards get the same address for the same photo as well, so the browser cache works.
+- Calls that need the meal plan at the same time (for example many `eatfresh.get_planner` with an old plan) share one request to KitchenOwl.
+- `eatfresh.search_collection` takes `limit` (1 to 200, default 50) and answers `total`, the number of all matches. If only the meal plan cannot be loaded, it still answers, with empty `planned_dates`; a rejected token still fails.
+- An unknown `recipe_id` loads the recipe list from KitchenOwl at most every 5 seconds, not on every try.
+- A recipe opened with the "Recipe link" button (or a link in the search field) is saved to the collection by itself: the panel calls `eatfresh/favorite` once after loading. The notice "Saved to your collection." shows the suggested categories, with "Change" and "Undo"; "Undo" takes the heart off and hides the recipe (it stays in KitchenOwl). A recipe that was in the collection already gives "Was already in your collection." (a hidden one is shown again) and nothing to undo. If saving fails, the recipe stays visible with a message and "Try again". Reloading the page and going back save nothing again. Recipes from search results are still saved only with the heart.
+
 ## 0.2.0 (2026-11-15)
 
 - "Recipe link" button in the top right corner of the panel; the field at the bottom is gone.

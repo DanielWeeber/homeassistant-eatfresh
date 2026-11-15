@@ -73,7 +73,7 @@ interface Toast {
   text: string;
   kind: "ok" | "error";
   id: number;
-  action?: ToastAction;
+  actions: ToastAction[];
   /** Runs once when the toast goes away without its action (deferred commits). */
   onExpire?: () => void;
 }
@@ -192,6 +192,8 @@ export class EatFreshPanel extends LitElement {
   private _toastTimer?: number;
   private _resize?: ResizeObserver;
   private _navigatedInside = false;
+  /** Link whose recipe is saved by itself once it has loaded (set only by the link dialog and the search field). */
+  private _autoSaveUrl?: string;
   private _collectionStale = true;
   private _collectionHidden = false;
   private _plannerStale = true;
@@ -265,7 +267,7 @@ export class EatFreshPanel extends LitElement {
     this._applyView(parsePath(pathname.slice(this._prefix.length)));
   };
 
-  private _navigate(view: View, replace = false): void {
+  private _navigate(view: View, replace = false, autoSave = false): void {
     const url = this._prefix + viewPath(view);
     if (url !== window.location.pathname) {
       if (replace) window.history.replaceState(window.history.state, "", url);
@@ -275,6 +277,7 @@ export class EatFreshPanel extends LitElement {
       window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace } }));
     }
     this._applyView(view);
+    if (autoSave && view.name === "recipe" && view.url) this._armAutoSave(view.url);
   }
 
   private _sameView(a: View, b: View): boolean {
@@ -289,6 +292,7 @@ export class EatFreshPanel extends LitElement {
       this._view = view;
       // A hint belongs to the view it came from; do not carry it along.
       this._clearToast();
+      this._autoSaveUrl = undefined;
       this._dialog = undefined;
       this.renderRoot.querySelector("main")?.scrollTo({ top: 0 });
     }
@@ -361,7 +365,7 @@ export class EatFreshPanel extends LitElement {
     const query = this._query.trim();
     if (!query) return;
     if (isHttpUrl(query)) {
-      this._navigate({ name: "recipe", url: query });
+      this._navigate({ name: "recipe", url: query }, false, true);
       return;
     }
     if (this._searchable.length && !this._selectedSources.size) return;
@@ -394,7 +398,16 @@ export class EatFreshPanel extends LitElement {
     }
     this._linkInvalid = false;
     this._dialog = undefined;
-    this._navigate({ name: "recipe", url });
+    this._navigate({ name: "recipe", url }, false, true);
+  }
+
+  /** Save the recipe of a link the person opened on purpose: now if it is already shown, else after loading. */
+  private _armAutoSave(url: string): void {
+    if (this._recipe && this._recipeState === "done" && this._recipeFor === `u:${url}`) {
+      this._autoSave(this._recipe);
+      return;
+    }
+    this._autoSaveUrl = url;
   }
 
   private async _loadRecipe(view: View & { name: "recipe" }, force = false): Promise<void> {
@@ -413,6 +426,11 @@ export class EatFreshPanel extends LitElement {
       this._recipe = res;
       this._favs.delete(res.recipe.key);
       this._recipeState = "done";
+      // One shot: reload, back/forward and shared links never get here with the flag set.
+      if (view.url && this._autoSaveUrl === view.url) {
+        this._autoSaveUrl = undefined;
+        this._autoSave(res);
+      }
     } catch (err) {
       if (seq !== this._recipeSeq) return;
       this._recipeError = this._err(err);
@@ -576,6 +594,84 @@ export class EatFreshPanel extends LitElement {
         "error",
       );
     } finally {
+      const busy = new Set(this._favBusy);
+      busy.delete(key);
+      this._favBusy = busy;
+    }
+  }
+
+  /**
+   * Save a recipe that was opened through a link: the person asked for it
+   * by pasting the link, so it lands in the collection without a second tap.
+   */
+  private async _autoSave(data: RecipeResponse): Promise<void> {
+    const { key, title } = data.recipe;
+    if (this._favBusy.has(key)) return;
+    if (this._isFav(key, data.favorite) && data.kitchenowl_id != null) {
+      this._showSavedToast(data.kitchenowl_id, title, [], false, undefined);
+      return;
+    }
+    this._favs = new Map(this._favs).set(key, true);
+    this._favBusy = new Set(this._favBusy).add(key);
+    try {
+      const res = await this._ws<{ kitchenowl_id: number; created: boolean; tags?: string[] }>({
+        type: "eatfresh/favorite",
+        key,
+      });
+      if (this._recipe?.recipe.key === key) {
+        this._recipe = { ...this._recipe, favorite: true, kitchenowl_id: res.kitchenowl_id };
+      }
+      this._collectionStale = true;
+      this._showSavedToast(res.kitchenowl_id, title, res.tags ?? [], res.created, key);
+    } catch (err) {
+      this._favs = new Map(this._favs).set(key, false);
+      this._showToast(this._t("auto_failed", { message: this._err(err) }), "error", {
+        actions: [{ label: this._t("again"), run: () => this._autoSave(data) }],
+        ms: UNDO_MS,
+      });
+    } finally {
+      const busy = new Set(this._favBusy);
+      busy.delete(key);
+      this._favBusy = busy;
+    }
+  }
+
+  private _showSavedToast(id: number, title: string, tags: string[], created: boolean, key: string | undefined): void {
+    const actions: ToastAction[] = [
+      {
+        label: tags.length ? this._t("change") : this._t("categories"),
+        run: () => this._openCategories(id, title, tags.length || created ? tags : undefined),
+      },
+    ];
+    // Nothing to take back when the recipe was in the collection before.
+    if (created && key) actions.push({ label: this._t("undo"), run: () => this._undoAutoSave(key, id) });
+    const text = !created
+      ? this._t("auto_existing")
+      : tags.length
+        ? this._t("auto_saved_tags", { tags: tags.join(", ") })
+        : this._t("auto_saved");
+    this._showToast(text, "ok", { actions, ms: UNDO_MS + 3000 });
+  }
+
+  /** Take back an automatic save: the heart goes off and the new recipe is hidden. */
+  private async _undoAutoSave(key: string, id: number): Promise<void> {
+    if (this._favBusy.has(key)) return;
+    this._favs = new Map(this._favs).set(key, false);
+    this._favBusy = new Set(this._favBusy).add(key);
+    let heartOff = false;
+    try {
+      await this._ws({ type: "eatfresh/unfavorite", key });
+      heartOff = true;
+      await this._ws({ type: "eatfresh/collection/hide", kitchenowl_id: id });
+      if (this._recipe?.recipe.key === key) this._recipe = { ...this._recipe, favorite: false };
+      this._patchRecipe(id, { hidden: true });
+      this._showToast(this._t("auto_undone"), "ok");
+    } catch (err) {
+      if (!heartOff) this._favs = new Map(this._favs).set(key, true);
+      else if (this._recipe?.recipe.key === key) this._recipe = { ...this._recipe, favorite: false };
+      this._showToast(this._t("auto_undo_failed", { message: this._err(err) }), "error");
+    } finally {
+      this._collectionStale = true;
       const busy = new Set(this._favBusy);
       busy.delete(key);
       this._favBusy = busy;
@@ -912,10 +1008,11 @@ export class EatFreshPanel extends LitElement {
   private _showToast(
     text: string,
     kind: Toast["kind"],
-    opts: { action?: ToastAction; ms?: number; onExpire?: () => void } = {},
+    opts: { action?: ToastAction; actions?: ToastAction[]; ms?: number; onExpire?: () => void } = {},
   ): void {
     this._clearToast();
-    this._toast = { text, kind, id: Date.now(), action: opts.action, onExpire: opts.onExpire };
+    const actions = opts.actions ?? (opts.action ? [opts.action] : []);
+    this._toast = { text, kind, id: Date.now(), actions, onExpire: opts.onExpire };
     this._toastTimer = window.setTimeout(() => this._clearToast(), opts.ms ?? TOAST_MS);
   }
 
@@ -926,12 +1023,13 @@ export class EatFreshPanel extends LitElement {
     toast?.onExpire?.();
   }
 
-  private _runToastAction(): void {
+  private _runToastAction(index: number): void {
     const toast = this._toast;
-    if (!toast?.action) return;
+    const action = toast?.actions[index];
+    if (!action) return;
     window.clearTimeout(this._toastTimer);
     this._toast = undefined;
-    toast.action.run();
+    action.run();
   }
 
   // ----------------------------------------------------------------- render
@@ -979,7 +1077,7 @@ export class EatFreshPanel extends LitElement {
         </header>
         <div class="body">
           <main>
-            <div class="content">
+            <div class="content ${this._toast ? "with-toast" : ""}">
               ${v === "search"
                 ? this._renderSearch()
                 : v === "recipe"
@@ -1015,13 +1113,17 @@ export class EatFreshPanel extends LitElement {
     const toast = this._toast;
     return html`<div class="sr" role="status" aria-live="polite">${toast?.text ?? ""}</div>
       ${toast
-        ? html`<div class="toast ${toast.kind}">
+        ? html`<div class="toast ${toast.kind} ${toast.actions.length > 1 ? "multi" : ""}">
             <span class="lead">${icon(toast.kind === "ok" ? mdiCheckCircleOutline : mdiAlertCircleOutline)}</span>
             <span class="msg">${toast.text}</span>
-            ${toast.action
-              ? html`<button class="toast-action" @click=${this._runToastAction}>${toast.action.label}</button>`
+            ${toast.actions.length
+              ? html`<span class="acts"
+                  >${toast.actions.map(
+                    (a, i) => html`<button class="toast-action" @click=${() => this._runToastAction(i)}>${a.label}</button>`,
+                  )}</span
+                >`
               : nothing}
-            <button class="icon-btn" aria-label=${this._t("close")} @click=${() => this._clearToast()}>
+            <button class="icon-btn close" aria-label=${this._t("close")} @click=${() => this._clearToast()}>
               ${icon(mdiClose)}
             </button>
           </div>`
@@ -1047,6 +1149,7 @@ export class EatFreshPanel extends LitElement {
     const busy = this._favBusy.has(key);
     return html`<button
       class="${cls} ${busy ? "busy" : ""}"
+      aria-busy=${busy ? "true" : "false"}
       aria-pressed=${fav ? "true" : "false"}
       aria-label=${this._t(fav ? "favorite_remove" : "favorite_add")}
       title=${this._t(fav ? "favorite_remove" : "favorite_add")}

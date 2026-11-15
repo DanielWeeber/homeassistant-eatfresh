@@ -53,14 +53,16 @@
   "options": {
     "step": {
       "init": {
-        "title": "Recipe sources",
-        "description": "Choose the websites EatFresh searches. Pasting a recipe link always works. EatFresh only loads a page when you search or open a recipe.\n\nChefkoch is off by default. Its terms of use (section 5.1) restrict automated access. If you turn Chefkoch on, you use it at your own risk and responsibility.",
+        "title": "Recipe sources and meal plan",
+        "description": "Choose the websites EatFresh searches. Pasting a recipe link always works. EatFresh only loads a page when you search or open a recipe.\n\nChefkoch is off by default. Its terms of use (section 5.1) restrict automated access. If you turn Chefkoch on, you use it at your own risk and responsibility.\n\nEatFresh fetches the KitchenOwl meal plan at the interval below and after every change made in EatFresh.",
         "data": {
           "sources": "Active sources",
-          "accept_chefkoch_terms": "I have read the Chefkoch terms (section 5.1) and use Chefkoch at my own responsibility"
+          "accept_chefkoch_terms": "I have read the Chefkoch terms (section 5.1) and use Chefkoch at my own responsibility",
+          "planner_interval": "Meal plan update interval (minutes)"
         },
         "data_description": {
-          "accept_chefkoch_terms": "Required only if Chefkoch is selected."
+          "accept_chefkoch_terms": "Required only if Chefkoch is selected.",
+          "planner_interval": "How often EatFresh fetches the meal plan for the calendar, the sensor and the cards (1 to 60 minutes). Each fetch is one request to KitchenOwl."
         }
       }
     },
@@ -86,6 +88,62 @@
         "recipe_id": {
           "name": "Recipe ID",
           "description": "ID of the recipe in KitchenOwl."
+        }
+      }
+    },
+    "search_collection": {
+      "name": "Search collection",
+      "description": "Returns the recipes saved in KitchenOwl whose name or an ingredient contains the search text, with the days they are planned on. Hidden recipes are left out.",
+      "fields": {
+        "query": {
+          "name": "Search text",
+          "description": "Part of the name or of an ingredient, any case. Leave empty for the whole collection."
+        },
+        "limit": {
+          "name": "Limit",
+          "description": "Most recipes in the response (1 to 200, default 50). The response names the number of all matches in total."
+        }
+      }
+    },
+    "get_planner": {
+      "name": "Get meal plan",
+      "description": "Returns the meals planned in KitchenOwl from a start day on a number of days, and the recipes planned without a day.",
+      "fields": {
+        "start_date": {
+          "name": "Start day",
+          "description": "First day. Default: today."
+        },
+        "days": {
+          "name": "Days",
+          "description": "Number of days from the start day (1 to 31). Default: 7."
+        }
+      }
+    },
+    "plan_recipe": {
+      "name": "Plan recipe",
+      "description": "Plans a recipe of the collection on a day in the KitchenOwl meal plan.",
+      "fields": {
+        "recipe_id": {
+          "name": "Recipe ID",
+          "description": "ID of the recipe in KitchenOwl."
+        },
+        "date": {
+          "name": "Day",
+          "description": "Day the recipe is planned on."
+        }
+      }
+    },
+    "unplan_recipe": {
+      "name": "Remove recipe from plan",
+      "description": "Takes a recipe off a day of the KitchenOwl meal plan. The recipe itself stays.",
+      "fields": {
+        "recipe_id": {
+          "name": "Recipe ID",
+          "description": "ID of the recipe in KitchenOwl."
+        },
+        "date": {
+          "name": "Day",
+          "description": "Day to remove the recipe from. Leave empty to remove the entry without a day."
         }
       }
     }
@@ -131,6 +189,9 @@
         "state_attributes": {
           "recipes": {
             "name": "Recipes"
+          },
+          "week": {
+            "name": "Week"
           }
         }
       }

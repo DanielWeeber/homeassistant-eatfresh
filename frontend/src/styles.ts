@@ -486,6 +486,13 @@ export const panelStyles = css`
   }
   .toast-action:hover { background: rgba(127, 127, 127, 0.25); }
   .toast .msg { flex: 1; min-width: 0; padding: 8px 0; overflow-wrap: anywhere; }
+  .toast .acts { display: contents; }
+  /* Two actions: the buttons get their own row under the text. */
+  .toast.multi { flex-wrap: wrap; row-gap: 0; padding-bottom: 0; }
+  .toast.multi .close { order: 2; }
+  .toast.multi .acts { order: 3; display: flex; flex-basis: 100%; justify-content: flex-end; gap: 4px; padding: 0 0 4px; }
+  /* Leave room under the content, so the hint never hides the end of the page. */
+  .content.with-toast { padding-bottom: 168px; }
   .toast .icon-btn:hover { background: rgba(127, 127, 127, 0.25); }
   .toast.error .lead { color: color-mix(in srgb, var(--ef-error) 70%, var(--ef-bg)); }
   .toast.ok .lead { color: color-mix(in srgb, var(--ef-success) 70%, var(--ef-bg)); }

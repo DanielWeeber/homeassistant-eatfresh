@@ -53,14 +53,16 @@
   "options": {
     "step": {
       "init": {
-        "title": "Rezeptquellen",
-        "description": "Wähle die Webseiten, in denen EatFresh sucht. „Rezept-Link einfügen“ geht immer. EatFresh ruft eine Seite nur ab, wenn du suchst oder ein Rezept öffnest.\n\nChefkoch ist standardmäßig aus. Die AGB von Chefkoch (Ziffer 5.1) schränken automatische Abrufe ein. Wenn du Chefkoch einschaltest, liegt die Nutzung in deiner eigenen Verantwortung.",
+        "title": "Rezeptquellen und Essensplan",
+        "description": "Wähle die Webseiten, in denen EatFresh sucht. „Rezept-Link einfügen“ geht immer. EatFresh ruft eine Seite nur ab, wenn du suchst oder ein Rezept öffnest.\n\nChefkoch ist standardmäßig aus. Die AGB von Chefkoch (Ziffer 5.1) schränken automatische Abrufe ein. Wenn du Chefkoch einschaltest, liegt die Nutzung in deiner eigenen Verantwortung.\n\nEatFresh holt den Essensplan aus KitchenOwl im unten eingestellten Abstand und nach jeder Änderung in EatFresh.",
         "data": {
           "sources": "Aktive Quellen",
-          "accept_chefkoch_terms": "Ich kenne die AGB von Chefkoch (Ziffer 5.1) und nutze Chefkoch in eigener Verantwortung"
+          "accept_chefkoch_terms": "Ich kenne die AGB von Chefkoch (Ziffer 5.1) und nutze Chefkoch in eigener Verantwortung",
+          "planner_interval": "Abgleich des Essensplans (Minuten)"
         },
         "data_description": {
-          "accept_chefkoch_terms": "Nur nötig, wenn Chefkoch ausgewählt ist."
+          "accept_chefkoch_terms": "Nur nötig, wenn Chefkoch ausgewählt ist.",
+          "planner_interval": "Wie oft EatFresh den Essensplan für Kalender, Sensor und Karten holt (1 bis 60 Minuten). Jeder Abgleich ist eine Anfrage an KitchenOwl."
         }
       }
     },
@@ -86,6 +88,62 @@
         "recipe_id": {
           "name": "Rezept-ID",
           "description": "ID des Rezepts in KitchenOwl."
+        }
+      }
+    },
+    "search_collection": {
+      "name": "Sammlung durchsuchen",
+      "description": "Gibt die in KitchenOwl gespeicherten Rezepte zurück, deren Name oder eine Zutat den Suchtext enthält, mit den Tagen, an denen sie geplant sind. Ausgeblendete Rezepte fehlen.",
+      "fields": {
+        "query": {
+          "name": "Suchtext",
+          "description": "Teil des Namens oder einer Zutat, Groß- und Kleinschreibung egal. Leer lassen für die ganze Sammlung."
+        },
+        "limit": {
+          "name": "Höchstzahl",
+          "description": "Höchstens so viele Rezepte in der Antwort (1 bis 200, Standard 50). Die Antwort nennt in „total“ die Zahl aller Treffer."
+        }
+      }
+    },
+    "get_planner": {
+      "name": "Essensplan lesen",
+      "description": "Gibt die in KitchenOwl geplanten Gerichte ab einem Starttag für eine Anzahl Tage zurück, dazu die Rezepte ohne Tag.",
+      "fields": {
+        "start_date": {
+          "name": "Starttag",
+          "description": "Erster Tag. Standard: heute."
+        },
+        "days": {
+          "name": "Tage",
+          "description": "Anzahl Tage ab dem Starttag (1 bis 31). Standard: 7."
+        }
+      }
+    },
+    "plan_recipe": {
+      "name": "Rezept einplanen",
+      "description": "Plant ein Rezept der Sammlung an einem Tag im KitchenOwl-Essensplan ein.",
+      "fields": {
+        "recipe_id": {
+          "name": "Rezept-ID",
+          "description": "ID des Rezepts in KitchenOwl."
+        },
+        "date": {
+          "name": "Tag",
+          "description": "Tag, an dem das Rezept geplant wird."
+        }
+      }
+    },
+    "unplan_recipe": {
+      "name": "Rezept aus dem Plan nehmen",
+      "description": "Nimmt ein Rezept von einem Tag im KitchenOwl-Essensplan. Das Rezept selbst bleibt.",
+      "fields": {
+        "recipe_id": {
+          "name": "Rezept-ID",
+          "description": "ID des Rezepts in KitchenOwl."
+        },
+        "date": {
+          "name": "Tag",
+          "description": "Tag, von dem das Rezept genommen wird. Leer lassen für den Eintrag ohne Tag."
         }
       }
     }
@@ -131,6 +189,9 @@
         "state_attributes": {
           "recipes": {
             "name": "Rezepte"
+          },
+          "week": {
+            "name": "Woche"
           }
         }
       }
