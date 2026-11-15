@@ -182,7 +182,7 @@ async def test_favorite_flow(
 ) -> None:
     """Heart: store first, then find_by_source, then create."""
     msg = await ws.call("eatfresh/favorite", key="fakea:r1")
-    assert msg["result"] == {"kitchenowl_id": 42, "created": True}
+    assert msg["result"] == {"kitchenowl_id": 42, "created": True, "tags": []}
     # First from the cached list, then once more with a fresh list.
     assert mock_client.find_by_source.await_args_list == [
         call(1, f"https://{RECIPE_HOST}/fakea/r1"),
@@ -193,13 +193,13 @@ async def test_favorite_flow(
 
     # Second heart comes from the store, no KitchenOwl call.
     msg = await ws.call("eatfresh/favorite", key="fakea:r1")
-    assert msg["result"] == {"kitchenowl_id": 42, "created": False}
+    assert msg["result"] == {"kitchenowl_id": 42, "created": False, "tags": []}
     assert mock_client.find_by_source.await_count == 2
 
     # Recipe already in KitchenOwl: no new recipe.
     mock_client.find_by_source.return_value = 99
     msg = await ws.call("eatfresh/favorite", key="fakeb:r2")
-    assert msg["result"] == {"kitchenowl_id": 99, "created": False}
+    assert msg["result"] == {"kitchenowl_id": 99, "created": False, "tags": []}
     assert mock_client.create_recipe.await_count == 1
 
     msg = await ws.call("eatfresh/recipe", key="fakea:r1")
@@ -243,14 +243,14 @@ async def test_same_recipe_with_two_keys(
     ]
 
     msg = await ws.call("eatfresh/favorite", key="fakea:123")
-    assert msg["result"] == {"kitchenowl_id": 42, "created": True}
+    assert msg["result"] == {"kitchenowl_id": 42, "created": True, "tags": []}
 
     # The link way sees the heart and does not create a second entry.
     msg = await ws.call("eatfresh/recipe", key=link_key)
     assert msg["result"]["favorite"] is True
     assert msg["result"]["kitchenowl_id"] == 42
     msg = await ws.call("eatfresh/favorite", key=link_key)
-    assert msg["result"] == {"kitchenowl_id": 42, "created": False}
+    assert msg["result"] == {"kitchenowl_id": 42, "created": False, "tags": []}
     assert mock_client.create_recipe.await_count == 1
     assert mock_client.find_by_source.await_count == 2
     msg = await ws.call("eatfresh/favorites")
@@ -480,6 +480,7 @@ async def test_other_errors_start_no_reauth(
 
 async def test_shopping_list_partial_success(ws: WS, mock_client: MagicMock) -> None:
     """If the third recipe fails, the answer says that two are on the list."""
+    mock_client.list_recipes.return_value.append({"id": 13, "name": "Cake", "tags": []})
     mock_client.add_recipe_to_shoppinglist.side_effect = [3, 4, KitchenOwlError("500")]
     msg = await ws.call("eatfresh/shopping_list/add", kitchenowl_ids=[11, 12, 13])
     assert not msg["success"]
@@ -511,5 +512,5 @@ async def test_heart_finds_recipe_added_meanwhile(
 
     mock_client.find_by_source.side_effect = find
     msg = await ws.call("eatfresh/favorite", key="fakea:r1")
-    assert msg["result"] == {"kitchenowl_id": 77, "created": False}
+    assert msg["result"] == {"kitchenowl_id": 77, "created": False, "tags": []}
     mock_client.create_recipe.assert_not_awaited()

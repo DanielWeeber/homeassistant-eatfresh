@@ -1,0 +1,31 @@
+/* Approximation of the Home Assistant default theme variables. */
+html {
+  --primary-color: #009ac7;
+  --text-primary-color: #ffffff;
+  --primary-background-color: #fafafa;
+  --card-background-color: #ffffff;
+  --primary-text-color: #212121;
+  --secondary-text-color: #727272;
+  --divider-color: rgba(0, 0, 0, 0.12);
+  --error-color: #db4437;
+  --success-color: #43a047;
+  --app-header-background-color: #fafafa;
+  --app-header-text-color: #212121;
+  --ha-card-border-radius: 12px;
+  --ha-card-border-color: #e0e0e0;
+  color-scheme: light;
+}
+html[data-theme="dark"] {
+  --primary-color: #009ac7;
+  --primary-background-color: #111111;
+  --card-background-color: #1c1c1c;
+  --primary-text-color: #e1e1e1;
+  --secondary-text-color: #9b9b9b;
+  --divider-color: rgba(225, 225, 225, 0.12);
+  --error-color: #ef5350;
+  --app-header-background-color: #111111;
+  --app-header-text-color: #e1e1e1;
+  --ha-card-border-color: rgba(225, 225, 225, 0.12);
+  color-scheme: dark;
+}
+html, body { margin: 0; padding: 0; background: var(--primary-background-color); }

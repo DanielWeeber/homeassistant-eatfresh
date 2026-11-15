@@ -5,19 +5,26 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 import logging
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.util import dt as dt_util
 from yarl import URL
 
+from . import kitchenowl as kitchenowl_module
+from .categories import canonical_category, category_names, suggest_categories
 from .const import (
     CHEFKOCH,
     CONF_ACCEPT_CHEFKOCH,
     CONF_SOURCES,
     DOMAIN,
     JSONLD,
+    MAX_TAG_LENGTH,
+    MAX_TAGS,
+    PLANNER_MAX_AGE,
     RECIPE_CACHE_TTL,
     SEARCH_CACHE_TTL,
 )
@@ -30,10 +37,14 @@ from .store import Favorite, FavoritesStore, TTLCache
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
+    from .coordinator import PlannerCoordinator
     from .kitchenowl import KitchenOwlClient
     from .sources.base import RecipeSource
 
 _LOGGER = logging.getLogger(__name__)
+
+# Message of ``RecipeNotFound`` for an id outside the own household.
+NOT_IN_COLLECTION = "The recipe is not in the collection"
 
 
 def is_http_url(url: object) -> bool:
@@ -59,6 +70,97 @@ class ShoppingListPartial(KitchenOwlError):
         self.done = done
         self.total = total
         self.items = items
+
+
+@dataclass(slots=True)
+class PlannerWeek:
+    """The meal plan of one week (Monday to Sunday)."""
+
+    week_start: date
+    days: list[tuple[date, list[dict[str, Any]]]]
+    unscheduled: list[dict[str, Any]]
+
+    @property
+    def recipe_ids(self) -> list[int]:
+        """Return the KitchenOwl ids planned on the days of the week.
+
+        A recipe planned on two days is in the list twice (it is cooked
+        twice); twice on the same day counts once.
+        """
+        return [recipe_id for _key, recipe_id in self.planned]
+
+    @property
+    def planned(self) -> list[tuple[str, int]]:
+        """Return ``("YYYY-MM-DD:<id>", id)`` for each recipe on a day.
+
+        Same order and rules as :attr:`recipe_ids`; the key names one
+        planned entry, so a partial transfer can remember what went through.
+        """
+        result: list[tuple[str, int]] = []
+        for day, entries in self.days:
+            for recipe_id in dict.fromkeys(entry["recipe_id"] for entry in entries):
+                result.append((f"{day.isoformat()}:{recipe_id}", recipe_id))
+        return result
+
+
+def week_start_of(day: date) -> date:
+    """Return the Monday of the week of a day."""
+    return day - timedelta(days=day.weekday())
+
+
+def today() -> date:
+    """Return today in the time zone of Home Assistant."""
+    return dt_util.now().date()
+
+
+def planner_date(entry: Mapping[str, Any]) -> date | None:
+    """Return the day of a meal plan entry as a date, or None without a day."""
+    value = entry.get("date")
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            _LOGGER.debug("Ignoring meal plan entry with day %r", value)
+    return None
+
+
+def build_week(entries: Iterable[Mapping[str, Any]], week_start: date) -> PlannerWeek:
+    """Sort meal plan entries into the 7 days of a week and the undated ones."""
+    start = week_start_of(week_start)
+    days: list[tuple[date, list[dict[str, Any]]]] = [
+        (start + timedelta(days=offset), []) for offset in range(7)
+    ]
+    by_day = {day: items for day, items in days}
+    unscheduled: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry.get("recipe_id"), int):
+            continue
+        item = dict(entry)
+        day = planner_date(entry)
+        if day is None:
+            if entry.get("date") in (None, ""):
+                unscheduled.append(item)
+            continue
+        if day in by_day:
+            by_day[day].append(item)
+    return PlannerWeek(week_start=start, days=days, unscheduled=unscheduled)
+
+
+def clean_tags(tags: Iterable[str]) -> list[str]:
+    """Return tags without blanks and duplicates (case does not matter)."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        name = " ".join(tag.split())[:MAX_TAG_LENGTH].strip()
+        if not name or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        result.append(name)
+    return result[:MAX_TAGS]
 
 
 @dataclass(slots=True)
@@ -92,10 +194,18 @@ class EatFreshData:
     public_session: aiohttp.ClientSession | None = None
     # Domains of switched-off opt-in sources (Chefkoch): never fetched.
     blocked_hosts: frozenset[str] = frozenset()
+    # Meal plan of KitchenOwl for the calendar and the sensor.
+    coordinator: PlannerCoordinator | None = None
+    # Language of Home Assistant for category names ("de", "en", ...).
+    hass: HomeAssistant | None = None
     # One lock per normalized recipe address, so two hearts at the same time
     # create only one recipe in KitchenOwl.
     _save_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _save_users: dict[str, int] = field(default_factory=dict)
+    # One lock per week (Monday), so two transfers of the ingredients of a
+    # week at the same time send them only once; the second one is asked.
+    _week_locks: dict[date, asyncio.Lock] = field(default_factory=dict)
+    _week_users: dict[date, int] = field(default_factory=dict)
 
     # ----- images -------------------------------------------------------
 
@@ -262,14 +372,24 @@ class EatFreshData:
 
     @callback
     def kitchenowl_id_of(self, key: str, url: str | None = None) -> int | None:
-        """Return the KitchenOwl id of a favorite or None."""
+        """Return the KitchenOwl id of a favorite or None.
+
+        A favorite whose recipe is hidden in the collection does not count.
+        """
         found = self.favorite_for(key, url)
-        return found[1]["kitchenowl_id"] if found else None
+        if found is None or self.store.is_hidden(found[1]["kitchenowl_id"]):
+            return None
+        return found[1]["kitchenowl_id"]
 
     @callback
     def is_favorite(self, key: str, url: str | None = None) -> bool:
         """Return True if the recipe has a heart (by key or by address)."""
-        return self.favorite_for(key, url) is not None
+        return self.kitchenowl_id_of(key, url) is not None
+
+    @property
+    def language(self) -> str:
+        """Return the language of Home Assistant."""
+        return self.hass.config.language if self.hass is not None else "en"
 
     async def async_save_recipe(self, recipe: Recipe) -> tuple[int, bool]:
         """Make sure a recipe is in KitchenOwl and marked as favorite.
@@ -293,6 +413,8 @@ class EatFreshData:
 
     async def _async_save_recipe_locked(self, recipe: Recipe) -> tuple[int, bool]:
         if (found := self.favorite_for(recipe.key, recipe.url)) is not None:
+            # A new heart shows a hidden recipe again.
+            self.store.async_unhide(found[1]["kitchenowl_id"])
             return found[1]["kitchenowl_id"], False
         created = False
         kitchenowl_id = await self.client.find_by_source(self.household_id, recipe.url)
@@ -304,8 +426,13 @@ class EatFreshData:
             )
         if kitchenowl_id is None:
             to_create = await self._without_unsafe_photo(recipe)
+            # Only the canonical categories become tags, not every keyword.
+            to_create = replace(
+                to_create, tags=suggest_categories(recipe, self.language)
+            )
             kitchenowl_id = await self.client.create_recipe(self.household_id, to_create)
             created = True
+        self.store.async_unhide(kitchenowl_id)
         self.store.async_set(
             recipe.key,
             source=recipe.source,
@@ -336,11 +463,50 @@ class EatFreshData:
         return recipe
 
     async def async_favorite(self, key: str) -> tuple[int, bool]:
-        """Set the heart of a recipe."""
+        """Set the heart of a recipe (and show it again if it was hidden)."""
         if (found := self.favorite_for(key)) is not None:
+            self.store.async_unhide(found[1]["kitchenowl_id"])
             return found[1]["kitchenowl_id"], False
         recipe = await self.async_get_recipe(key)
         return await self.async_save_recipe(recipe)
+
+    async def async_recipe_tags(self, kitchenowl_id: int) -> list[str]:
+        """Return the tags of a KitchenOwl recipe (empty if it is not listed)."""
+        for item in await self.client.list_recipes(self.household_id):
+            if item.get("id") == kitchenowl_id:
+                return self.localize_tags(item.get("tags") or [])
+        return []
+
+    def localize_tags(self, tags: Iterable[Any]) -> list[str]:
+        """Return tags with canonical categories named in HA's language.
+
+        "Soup" and "Suppe" are the same category, so both become one tag
+        (and one filter chip in the panel).
+        """
+        named = []
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            category = canonical_category(tag)
+            named.append(category.name(self.language) if category else tag)
+        return clean_tags(named)
+
+    async def async_require_own(self, kitchenowl_ids: Iterable[int]) -> None:
+        """Raise ``RecipeNotFound`` unless all recipes are in the own household.
+
+        Checked before anything is sent for a single recipe, so an id from
+        another household changes nothing and never looks like a rejected
+        token. The recipe list is reused for a short time; a missing id is
+        looked up once more in a fresh list.
+        """
+        wanted = set(kitchenowl_ids)
+        if not wanted:
+            return
+        missing = wanted - await self.client.recipe_ids(self.household_id)
+        if missing:
+            missing -= await self.client.recipe_ids(self.household_id, fresh=True)
+        if missing:
+            raise RecipeNotFound(NOT_IN_COLLECTION)
 
     @callback
     def async_unfavorite(self, key: str) -> None:
@@ -353,14 +519,189 @@ class EatFreshData:
 
     @callback
     def favorites(self) -> list[tuple[str, Favorite]]:
-        """Return all favorites, newest first."""
-        return self.store.items()
+        """Return all favorites whose recipe is not hidden, newest first."""
+        return [
+            (key, favorite)
+            for key, favorite in self.store.items()
+            if not self.store.is_hidden(favorite["kitchenowl_id"])
+        ]
 
     # ----- KitchenOwl ---------------------------------------------------
 
-    async def async_collection(self) -> list[dict[str, Any]]:
-        """Return the recipes stored in KitchenOwl."""
-        return await self.client.list_recipes(self.household_id)
+    async def async_collection(self, include_hidden: bool = False) -> list[dict[str, Any]]:
+        """Return the recipes stored in KitchenOwl.
+
+        Each recipe gets ``hidden``. Hidden recipes are left out unless
+        ``include_hidden`` is set.
+        """
+        recipes = []
+        for recipe in await self.client.list_recipes(self.household_id):
+            hidden = self.store.is_hidden(recipe.get("id"))
+            if hidden and not include_hidden:
+                continue
+            tags = self.localize_tags(recipe.get("tags") or [])
+            recipes.append({**recipe, "tags": tags, "hidden": hidden})
+        return recipes
+
+    async def async_collection_recipe(self, kitchenowl_id: int) -> Recipe:
+        """Return a recipe as stored in KitchenOwl. No recipe page is fetched."""
+        await self.async_require_own([kitchenowl_id])
+        data = await self.client.get_recipe(kitchenowl_id)
+        household = data.get("household_id")
+        if household is not None and household != self.household_id:
+            raise RecipeNotFound("The recipe belongs to another household")
+        return kitchenowl_module.recipe_to_model(data)
+
+    async def async_hide(self, kitchenowl_id: int) -> None:
+        """Hide a recipe of the collection. KitchenOwl stays unchanged.
+
+        Only recipes of the own collection are accepted, so the store cannot
+        fill up with ids that do not exist.
+        """
+        if not self.store.is_hidden(kitchenowl_id):
+            await self.async_require_own([kitchenowl_id])
+        self.store.async_hide(kitchenowl_id)
+
+    @callback
+    def async_unhide(self, kitchenowl_id: int) -> None:
+        """Show a hidden recipe in the collection again."""
+        self.store.async_unhide(kitchenowl_id)
+
+    async def async_set_tags(self, kitchenowl_id: int, tags: list[str]) -> list[str]:
+        """Replace the tags of a KitchenOwl recipe.
+
+        A tag that names a canonical category in another language is written
+        with the name in the language of Home Assistant.
+        """
+        await self.async_require_own([kitchenowl_id])
+        stored = await self.client.set_recipe_tags(
+            kitchenowl_id, self.localize_tags(tags)
+        )
+        return self.localize_tags(stored)
+
+    async def async_tags(self) -> tuple[list[str], list[str]]:
+        """Return the canonical categories and all tags of the household.
+
+        Tags naming a canonical category in another language ("Soup" in a
+        German Home Assistant) come back under the name in HA's language.
+        """
+        tags = await self.client.list_tags(self.household_id)
+        return category_names(self.language), self.localize_tags(tags)
+
+    # ----- meal plan ----------------------------------------------------
+
+    async def async_planner_entries(self) -> list[dict[str, Any]]:
+        """Fetch the meal plan and share it with the calendar and the sensor."""
+        entries = await self.client.list_planner(self.household_id)
+        if self.coordinator is not None:
+            self.coordinator.async_set_updated_data(entries)
+        return entries
+
+    async def async_planner_week(
+        self, week_start: date | None, *, use_cache: bool = True
+    ) -> PlannerWeek:
+        """Return the meal plan of a week (default: the current week).
+
+        For the current week the plan of the coordinator is used while it is
+        younger than ``PLANNER_MAX_AGE`` (many cards on many screens), unless
+        ``use_cache`` is off. A change through EatFresh refreshes it at once.
+        """
+        day = week_start or today()
+        current = week_start_of(day) == week_start_of(today())
+        if use_cache and current and self.coordinator is not None:
+            cached = self.coordinator.fresh_data(PLANNER_MAX_AGE)
+            if cached is not None:
+                return build_week(cached, day)
+        entries = await self.async_planner_entries()
+        return build_week(entries, day)
+
+    async def async_planner_add(self, kitchenowl_id: int, day: date) -> None:
+        """Plan a recipe of the own collection on a day."""
+        await self.async_require_own([kitchenowl_id])
+        try:
+            await self.client.add_planner_entry(self.household_id, kitchenowl_id, day)
+        finally:
+            await self._async_refresh_planner()
+
+    async def async_planner_remove(self, kitchenowl_id: int, day: date | None) -> None:
+        """Take a recipe off a day (or off the plan without a day)."""
+        try:
+            await self.client.remove_planner_entry(
+                self.household_id, kitchenowl_id, day
+            )
+        finally:
+            await self._async_refresh_planner()
+
+    async def async_planner_shopping_list(
+        self, week_start: date | None, *, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Put the ingredients of the planned recipes of a week on the list.
+
+        Return ``{added, recipes, at}``: the number of items and of recipes
+        and the time of this transfer. A recipe planned on two days counts
+        twice; recipes without a day are left out. If the week went to the
+        list before and ``confirm`` is not set, nothing is sent and the
+        answer is ``{added: 0, recipes: 0, already_added_at}`` (the time of
+        the earlier transfer, from the store: the same for every device and
+        person). A partial transfer raises ``ShoppingListPartial`` and still
+        counts as a transfer; the planned entries that went through are
+        remembered, and a confirmed second try sends only the rest.
+
+        Two calls for the same week at the same time run one after the
+        other (a lock per week around checking and sending), so the second
+        one is asked instead of sending everything again.
+        """
+        monday = week_start_of(week_start or today())
+        lock = self._week_locks.setdefault(monday, asyncio.Lock())
+        self._week_users[monday] = self._week_users.get(monday, 0) + 1
+        try:
+            async with lock:
+                return await self._async_planner_shopping_list_locked(
+                    week_start, confirm=confirm
+                )
+        finally:
+            # Also after an error or a cancel: the lock never stays behind.
+            self._week_users[monday] -= 1
+            if not self._week_users[monday]:
+                del self._week_users[monday]
+                del self._week_locks[monday]
+
+    async def _async_planner_shopping_list_locked(
+        self, week_start: date | None, *, confirm: bool
+    ) -> dict[str, Any]:
+        week = await self.async_planner_week(week_start, use_cache=False)
+        before = self.store.week_list_time(week.week_start)
+        if before is not None and not confirm:
+            return {"added": 0, "recipes": 0, "already_added_at": before}
+        done = self.store.week_list_done(week.week_start)
+        planned = [item for item in week.planned if item[0] not in done]
+        if not planned:
+            if done:
+                # The rest of a partial transfer is empty: the week is complete.
+                at = self.store.async_set_week_list_time(week.week_start)
+                return {"added": 0, "recipes": 0, "at": at}
+            return {"added": 0, "recipes": 0, "at": before}
+        recipe_ids = [recipe_id for _key, recipe_id in planned]
+        try:
+            added = await self.async_add_to_shopping_list(recipe_ids)
+        except ShoppingListPartial as err:
+            self.store.async_set_week_list_time(
+                week.week_start,
+                done=[*done, *(key for key, _id in planned[: err.done])],
+            )
+            raise
+        at = self.store.async_set_week_list_time(week.week_start)
+        return {"added": added, "recipes": len(recipe_ids), "at": at}
+
+    @callback
+    def week_list_time(self, week_start: date) -> str | None:
+        """Return when the week of a day went to the shopping list, or None."""
+        return self.store.week_list_time(week_start_of(week_start))
+
+    async def _async_refresh_planner(self) -> None:
+        """Refresh the calendar and the sensor after a change."""
+        if self.coordinator is not None:
+            await self.coordinator.async_refresh()
 
     async def async_add_to_shopping_list(self, recipe_ids: list[int]) -> int:
         """Put the ingredients of KitchenOwl recipes on the shopping list.
@@ -369,6 +710,7 @@ class EatFreshData:
         fails after others went through, ``ShoppingListPartial`` says how many
         are already on the list, so a second try can leave them out.
         """
+        await self.async_require_own(recipe_ids)
         added = 0
         for done, recipe_id in enumerate(recipe_ids):
             try:

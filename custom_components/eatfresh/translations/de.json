@@ -114,6 +114,26 @@
     },
     "shopping_list_partial": {
       "message": "Nur {added_recipes} von {total} Rezepten sind auf der Einkaufsliste: {message}"
+    },
+    "not_in_collection": {
+      "message": "Das Rezept gehört nicht zur Sammlung dieses Haushalts."
+    }
+  },
+  "entity": {
+    "calendar": {
+      "week_plan": {
+        "name": "Wochenplan"
+      }
+    },
+    "sensor": {
+      "today": {
+        "name": "Heute",
+        "state_attributes": {
+          "recipes": {
+            "name": "Rezepte"
+          }
+        }
+      }
     }
   }
 }

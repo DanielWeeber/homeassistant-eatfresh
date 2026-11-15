@@ -24,7 +24,14 @@ export function formatAmount(lang: Lang, amount: number | null): string {
 }
 
 export function ingredientQty(lang: Lang, ing: Ingredient): string {
-  return [formatAmount(lang, ing.amount), ing.unit ?? ""].filter(Boolean).join(" ");
+  const qty = [formatAmount(lang, ing.amount), ing.unit ?? ""].filter(Boolean).join(" ");
+  if (qty) return qty;
+  // Recipes from KitchenOwl carry the amount only in `raw` ("<description> <name>").
+  const raw = (ing.raw ?? "").trim();
+  const name = (ing.name ?? "").trim();
+  if (name && raw.length > name.length && raw.toLowerCase().endsWith(name.toLowerCase()))
+    return raw.slice(0, raw.length - name.length).trim();
+  return "";
 }
 
 /** Return a short host name for a URL, or the input itself. */
@@ -76,8 +83,12 @@ export function parsePath(path: string): View {
     }
   };
   switch (parts[0]) {
-    case "collection":
-      return { name: "collection" };
+    case "collection": {
+      const id = Number(parts[1]);
+      return parts[1] && Number.isInteger(id) && id > 0 ? { name: "korecipe", id } : { name: "collection" };
+    }
+    case "planner":
+      return { name: "planner" };
     case "recipe": {
       const key = decode(parts.slice(1).join("/"));
       return key ? { name: "recipe", key } : { name: "search" };
@@ -93,9 +104,60 @@ export function parsePath(path: string): View {
 
 export function viewPath(view: View): string {
   if (view.name === "collection") return "/collection";
+  if (view.name === "planner") return "/planner";
+  if (view.name === "korecipe") return `/collection/${view.id}`;
   if (view.name === "recipe") {
     if (view.key) return `/recipe/${encodeURIComponent(view.key)}`;
     if (view.url) return `/link/${encodeURIComponent(view.url)}`;
   }
   return "/search";
+}
+
+// ------------------------------------------------------------------ dates
+// Dates are plain "YYYY-MM-DD" strings in local time, like the WebSocket API.
+
+const pad = (n: number) => String(n).padStart(2, "0");
+
+export function isoDate(d: Date): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function parseDate(text: string): Date {
+  const [y, m, d] = text.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1);
+}
+
+export function addDays(text: string, days: number): string {
+  const d = parseDate(text);
+  d.setDate(d.getDate() + days);
+  return isoDate(d);
+}
+
+export function today(): string {
+  return isoDate(new Date());
+}
+
+/** Monday of the week that holds the given day. */
+export function mondayOf(text: string): string {
+  const d = parseDate(text);
+  return addDays(text, -((d.getDay() + 6) % 7));
+}
+
+const locale = (lang: Lang) => (lang === "de" ? "de-DE" : "en-GB");
+
+/** "Mittwoch, 18.11." or "Wednesday 18/11". */
+export function formatDay(lang: Lang, text: string, weekday: "long" | "short" = "long"): string {
+  return parseDate(text).toLocaleDateString(locale(lang), { weekday, day: "numeric", month: "numeric" });
+}
+
+export function weekdayName(lang: Lang, text: string, weekday: "long" | "short" = "long"): string {
+  return parseDate(text).toLocaleDateString(locale(lang), { weekday });
+}
+
+/** "9.–15. November 2026" style label for a week. */
+export function formatWeek(lang: Lang, monday: string): string {
+  const a = parseDate(monday);
+  const b = parseDate(addDays(monday, 6));
+  const fmt = new Intl.DateTimeFormat(locale(lang), { day: "numeric", month: "long", year: "numeric" });
+  return fmt.formatRange(a, b);
 }

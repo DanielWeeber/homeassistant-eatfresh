@@ -2,10 +2,11 @@ import resolve from "@rollup/plugin-node-resolve";
 import terser from "@rollup/plugin-terser";
 import typescript from "@rollup/plugin-typescript";
 
-export default {
-  input: "src/eatfresh-panel.ts",
+// Two self-contained files: the sidebar panel and the dashboard cards.
+const bundle = (input, file) => ({
+  input,
   output: {
-    file: "../custom_components/eatfresh/frontend/eatfresh-panel.js",
+    file: `../custom_components/eatfresh/frontend/${file}`,
     format: "es",
     inlineDynamicImports: true,
     sourcemap: false,
@@ -15,4 +16,9 @@ export default {
     typescript({ tsconfig: "./tsconfig.json" }),
     terser({ ecma: 2022, module: true, format: { comments: false } }),
   ],
-};
+});
+
+export default [
+  bundle("src/eatfresh-panel.ts", "eatfresh-panel.js"),
+  bundle("src/eatfresh-cards.ts", "eatfresh-cards.js"),
+];

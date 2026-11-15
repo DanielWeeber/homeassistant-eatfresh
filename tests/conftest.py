@@ -220,8 +220,9 @@ def mock_client() -> MagicMock:
                 "photo": "abc123.jpg",
                 "time": 25,
                 "yields": 4,
+                "tags": ["Suppe"],
             },
-            {"id": 12, "name": "Bread", "source": None, "photo": None},
+            {"id": 12, "name": "Bread", "source": None, "photo": None, "tags": []},
         ]
     )
     client.get_recipe = AsyncMock(return_value={"id": 11, "name": "Soup"})
@@ -229,6 +230,22 @@ def mock_client() -> MagicMock:
     client.create_recipe = AsyncMock(return_value=42)
     client.add_recipe_to_shoppinglist = AsyncMock(return_value=3)
     client.fetch_photo = AsyncMock(return_value=(b"\xff\xd8photo", "image/jpeg"))
+    client.list_tags = AsyncMock(return_value=["Suppe", "Schnell"])
+    client.set_recipe_tags = AsyncMock(side_effect=lambda recipe_id, tags: list(tags))
+    client.list_planner = AsyncMock(return_value=[])
+    client.add_planner_entry = AsyncMock(return_value=None)
+    client.remove_planner_entry = AsyncMock(return_value=None)
+
+    async def recipe_ids(household_id: int, *, fresh: bool = False) -> set[int]:
+        # Like the real client: the recipes of the list plus a created one.
+        ids = {int(item["id"]) for item in client.list_recipes.return_value}
+        if client.create_recipe.await_count and isinstance(
+            client.create_recipe.return_value, int
+        ):
+            ids.add(client.create_recipe.return_value)
+        return ids
+
+    client.recipe_ids = AsyncMock(side_effect=recipe_ids)
     return client
 
 

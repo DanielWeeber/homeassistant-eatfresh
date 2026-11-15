@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 import aiohttp
-from homeassistant.const import EVENT_HOMEASSISTANT_CLOSE
+from homeassistant.const import EVENT_HOMEASSISTANT_CLOSE, Platform
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
@@ -22,6 +22,7 @@ from .const import (
     DOMAIN,
     USER_AGENT,
 )
+from .coordinator import PlannerCoordinator
 from .errors import KitchenOwlAuthError, KitchenOwlError
 from .http import HttpClient, create_public_session
 from .image_proxy import EatFreshImageView
@@ -35,6 +36,7 @@ from .websocket_api import async_register_websocket_commands
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS: list[Platform] = [Platform.CALENDAR, Platform.SENSOR]
 
 __all__ = ["EatFreshConfigEntry", "EatFreshData"]
 
@@ -93,25 +95,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: EatFreshConfigEntry) -> 
     store = FavoritesStore(hass)
     await store.async_load()
 
+    household_id = int(entry.data[CONF_HOUSEHOLD_ID])
+    coordinator = PlannerCoordinator(hass, entry, client, household_id)
+    # Not the first-refresh helper: an unreachable meal plan only makes the
+    # entities unavailable, the panel keeps working. A rejected token still
+    # starts the reauthentication.
+    await coordinator.async_refresh()
+
     data = EatFreshData(
         client=client,
         sources=sources,
         store=store,
-        household_id=int(entry.data[CONF_HOUSEHOLD_ID]),
+        household_id=household_id,
         shoppinglist_id=int(entry.data[CONF_SHOPPINGLIST_ID]),
         public_session=public_session,
         blocked_hosts=blocked,
+        coordinator=coordinator,
+        hass=hass,
     )
     data.allow_favorite_images()
     entry.runtime_data = data
 
     await panel.async_register_panel(hass)
+    await panel.async_register_cards(hass)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EatFreshConfigEntry) -> bool:
-    """Remove the panel and drop the caches."""
+    """Remove the entities, the panel and the cards, and drop the caches."""
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
     panel.async_unregister_panel(hass)
+    panel.async_unregister_cards(hass)
     entry.runtime_data.search_cache.clear()
     entry.runtime_data.recipe_cache.clear()
     entry.runtime_data.url_cache.clear()

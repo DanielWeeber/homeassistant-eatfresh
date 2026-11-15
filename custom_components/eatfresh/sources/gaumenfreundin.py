@@ -99,7 +99,15 @@ class GaumenfreundinSource(RecipeSource):
             if not self.matches_url(recipe_id):
                 raise RecipeNotFound("Not an address of gaumenfreundin.de")
             page = await self._client.get_text(recipe_id)
-            return await async_recipe_from_html(page, source=self.id, recipe_id=recipe_id, url=recipe_id)
+            # A pasted link: the canonical address of the page (without
+            # tracking parameters) is saved, the same one the search gives.
+            return await async_recipe_from_html(
+                page,
+                source=self.id,
+                recipe_id=recipe_id,
+                url=recipe_id,
+                canonical=True,
+            )
         if not recipe_id.isdigit():
             raise RecipeNotFound("Invalid recipe id")
         data = await self._client.get_json(f"{API_URL}/{recipe_id}")

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import date
 from functools import wraps
 import logging
+import re
 from typing import Any
 
 from homeassistant.components import websocket_api
@@ -20,7 +22,11 @@ from .const import (
     ERR_NOT_LOADED,
     ERR_SOURCE_BLOCKED,
     ERR_SOURCE_ERROR,
+    MAX_PLANNER_YEAR,
     MAX_SEARCH_LIMIT,
+    MAX_TAG_LENGTH,
+    MAX_TAGS,
+    MIN_PLANNER_YEAR,
 )
 from .errors import (
     EatFreshError,
@@ -33,13 +39,41 @@ from .errors import (
 from .image_proxy import sign_image_url, sign_photo
 from .runtime import (
     EatFreshData,
+    PlannerWeek,
     ShoppingListPartial,
     async_reauth_on_auth_error,
     error_message,
     get_runtime_data,
+    today,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+KITCHENOWL_ID = vol.All(vol.Coerce(int), vol.Range(min=1))
+
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _iso_date(value: Any) -> date:
+    """Validate a day written as YYYY-MM-DD, in the years 2000 to 2100.
+
+    KitchenOwl keeps "no day" as 0001-01-01, and days far away break the
+    week arithmetic, so only sensible years are accepted.
+    """
+    if isinstance(value, str) and _ISO_DATE.fullmatch(value):
+        try:
+            day = date.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            if MIN_PLANNER_YEAR <= day.year <= MAX_PLANNER_YEAR:
+                return day
+            raise vol.Invalid(
+                f"Expected a day in the years {MIN_PLANNER_YEAR} to {MAX_PLANNER_YEAR}"
+            )
+    raise vol.Invalid("Expected a date as YYYY-MM-DD")
+
 
 type Handler = Callable[
     [HomeAssistant, websocket_api.ActiveConnection, dict[str, Any], EatFreshData],
@@ -117,7 +151,16 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_unfavorite,
         ws_favorites,
         ws_collection,
+        ws_collection_recipe,
+        ws_collection_hide,
+        ws_collection_unhide,
+        ws_collection_set_tags,
+        ws_tags,
         ws_shopping_list_add,
+        ws_planner,
+        ws_planner_add,
+        ws_planner_remove,
+        ws_planner_shopping_list,
     ):
         websocket_api.async_register_command(hass, command)
 
@@ -164,7 +207,7 @@ async def ws_search(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Search the recipe sources."""
+    """Search the recipe sources. ``limit`` applies to each source."""
     result = await data.async_search(msg["query"], msg.get("sources"), msg["limit"])
     hits = []
     for hit in result.hits:
@@ -224,10 +267,20 @@ async def ws_favorite(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Set the heart: save the recipe in KitchenOwl if needed."""
+    """Set the heart: save the recipe in KitchenOwl if needed.
+
+    A recipe hidden in the collection is shown again. ``tags`` are the tags
+    of the recipe in KitchenOwl.
+    """
     kitchenowl_id, created = await data.async_favorite(msg["key"])
+    try:
+        tags = await data.async_recipe_tags(kitchenowl_id)
+    except EatFreshError as err:
+        # The heart is set; missing tags must not turn it into an error.
+        _LOGGER.debug("Tags of recipe %s not loaded: %s", kitchenowl_id, err)
+        tags = []
     connection.send_result(
-        msg["id"], {"kitchenowl_id": kitchenowl_id, "created": created}
+        msg["id"], {"kitchenowl_id": kitchenowl_id, "created": created, "tags": tags}
     )
 
 
@@ -273,7 +326,12 @@ async def ws_favorites(
     connection.send_result(msg["id"], {"favorites": favorites})
 
 
-@websocket_api.websocket_command({vol.Required("type"): "eatfresh/collection"})
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection",
+        vol.Optional("include_hidden", default=False): bool,
+    }
+)
 @websocket_api.async_response
 @_with_data
 async def ws_collection(
@@ -282,7 +340,7 @@ async def ws_collection(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Return the recipes stored in KitchenOwl."""
+    """Return the recipes stored in KitchenOwl (hidden ones only on request)."""
     recipes = [
         {
             "kitchenowl_id": recipe["id"],
@@ -291,10 +349,117 @@ async def ws_collection(
             "source": recipe.get("source"),
             "time": recipe.get("time"),
             "yields": recipe.get("yields"),
+            "tags": list(recipe.get("tags") or []),
+            "hidden": recipe["hidden"],
         }
-        for recipe in await data.async_collection()
+        for recipe in await data.async_collection(msg["include_hidden"])
     ]
     connection.send_result(msg["id"], {"recipes": recipes})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/recipe",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_recipe(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Return a recipe as stored in KitchenOwl, without loading its web page."""
+    kitchenowl_id = msg["kitchenowl_id"]
+    recipe = await data.async_collection_recipe(kitchenowl_id)
+    item = recipe.as_dict()
+    item["image"] = sign_photo(hass, recipe.image)
+    connection.send_result(
+        msg["id"],
+        {
+            "recipe": item,
+            "kitchenowl_id": kitchenowl_id,
+            "tags": data.localize_tags(recipe.tags),
+            "hidden": data.store.is_hidden(kitchenowl_id),
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/hide",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_hide(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Hide a recipe of the own collection. KitchenOwl stays unchanged."""
+    await data.async_hide(msg["kitchenowl_id"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/unhide",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_unhide(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Show a hidden recipe in the collection again."""
+    data.async_unhide(msg["kitchenowl_id"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/set_tags",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Required("tags"): vol.All(
+            [vol.All(str, vol.Length(max=MAX_TAG_LENGTH))],
+            vol.Length(max=MAX_TAGS),
+        ),
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_set_tags(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Replace the tags (categories) of a KitchenOwl recipe."""
+    tags = await data.async_set_tags(msg["kitchenowl_id"], msg["tags"])
+    connection.send_result(msg["id"], {"tags": tags})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "eatfresh/tags"})
+@websocket_api.async_response
+@_with_data
+async def ws_tags(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Return the canonical categories and all tags of the household."""
+    categories, tags = await data.async_tags()
+    connection.send_result(msg["id"], {"categories": categories, "tags": tags})
 
 
 @websocket_api.websocket_command(
@@ -316,3 +481,126 @@ async def ws_shopping_list_add(
     """Put the ingredients of KitchenOwl recipes on the shopping list."""
     added = await data.async_add_to_shopping_list(msg["kitchenowl_ids"])
     connection.send_result(msg["id"], {"added": added})
+
+
+def _planner_item(hass: HomeAssistant, entry: dict[str, Any]) -> dict[str, Any]:
+    """Return one meal plan entry as the panel and the cards read it."""
+    return {
+        "kitchenowl_id": entry["recipe_id"],
+        "name": entry.get("name"),
+        "image": sign_photo(hass, entry.get("photo")),
+    }
+
+
+def _week_result(
+    hass: HomeAssistant, week: PlannerWeek, data: EatFreshData
+) -> dict[str, Any]:
+    """Return a week; ``today`` lets the panel and the cards use HA's day.
+
+    ``shopping_list_at`` is when the week went to the shopping list (ISO
+    time, UTC) or None.
+    """
+    return {
+        "week_start": week.week_start.isoformat(),
+        "today": today().isoformat(),
+        "shopping_list_at": data.week_list_time(week.week_start),
+        "days": [
+            {
+                "date": day.isoformat(),
+                "entries": [_planner_item(hass, entry) for entry in entries],
+            }
+            for day, entries in week.days
+        ],
+        "unscheduled": [_planner_item(hass, entry) for entry in week.unscheduled],
+    }
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/planner",
+        vol.Optional("week_start"): _iso_date,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_planner(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Return the meal plan of a week, Monday to Sunday.
+
+    Without ``week_start`` the current week is used (time zone of Home
+    Assistant). A day other than Monday stands for the week it is in.
+    ``today`` is the current day in the time zone of Home Assistant, so the
+    panel and the cards do not depend on the time zone of the browser.
+    """
+    week = await data.async_planner_week(msg.get("week_start"))
+    connection.send_result(msg["id"], _week_result(hass, week, data))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/planner/add",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Required("date"): _iso_date,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_planner_add(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Plan a KitchenOwl recipe on a day."""
+    await data.async_planner_add(msg["kitchenowl_id"], msg["date"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/planner/remove",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Optional("date"): vol.Any(None, _iso_date),
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_planner_remove(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Take a recipe off a day, or off the plan without a day."""
+    await data.async_planner_remove(msg["kitchenowl_id"], msg.get("date"))
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/planner/shopping_list",
+        vol.Optional("week_start"): _iso_date,
+        vol.Optional("confirm", default=False): bool,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_planner_shopping_list(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Put the ingredients of the recipes planned in a week on the list.
+
+    If the week went to the list before (on any device), nothing is sent
+    unless ``confirm`` is set; the answer then carries ``already_added_at``.
+    """
+    result = await data.async_planner_shopping_list(
+        msg.get("week_start"), confirm=msg["confirm"]
+    )
+    connection.send_result(msg["id"], result)

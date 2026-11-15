@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from datetime import timedelta
+from collections.abc import Iterable
+from datetime import date, timedelta
+import logging
 import time
 from typing import Any, TypedDict
 
@@ -11,8 +13,17 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .const import CACHE_MAX_ENTRIES, STORAGE_KEY, STORAGE_SAVE_DELAY, STORAGE_VERSION
+from .const import (
+    CACHE_MAX_ENTRIES,
+    MAX_WEEK_LISTS,
+    STORAGE_KEY,
+    STORAGE_MINOR_VERSION,
+    STORAGE_SAVE_DELAY,
+    STORAGE_VERSION,
+)
 from .kitchenowl import normalize_source
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Favorite(TypedDict):
@@ -27,26 +38,91 @@ class Favorite(TypedDict):
     added_at: str
 
 
+class _EatFreshStore(Store[dict[str, Any]]):
+    """Home Assistant store that upgrades files of older EatFresh versions."""
+
+    async def _async_migrate_func(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep everything and add what newer versions expect.
+
+        1.1 (EatFresh 0.1.0) had only favorites; 1.2 adds hidden recipes.
+        """
+        data = dict(old_data or {})
+        if old_major_version == 1 and old_minor_version < 2:
+            data.setdefault("hidden", {})
+        return data
+
+
 class FavoritesStore:
-    """Favorites keyed by "<source>:<id>", saved with the Home Assistant store."""
+    """Favorites keyed by "<source>:<id>" and hidden collection recipes.
+
+    Saved with the Home Assistant store. Hidden recipes are keyed by the
+    KitchenOwl id (as text) and hold the time they were hidden. ``week_lists``
+    holds, per Monday (``YYYY-MM-DD``), when the ingredients of that week
+    were put on the shopping list, so a second transfer asks first.
+    ``week_list_done`` holds, per Monday, the planned entries
+    (``YYYY-MM-DD:<id>``) that went through before a transfer stopped
+    halfway, so a second try sends only the rest.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the store."""
-        self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store: Store[dict[str, Any]] = _EatFreshStore(
+            hass, STORAGE_VERSION, STORAGE_KEY, minor_version=STORAGE_MINOR_VERSION
+        )
         self._favorites: dict[str, Favorite] = {}
+        self._hidden: dict[str, str] = {}
+        self._week_lists: dict[str, str] = {}
+        self._week_list_done: dict[str, list[str]] = {}
 
     async def async_load(self) -> None:
-        """Load the favorites from disk."""
-        data = await self._store.async_load()
-        favorites = (data or {}).get("favorites") or {}
+        """Load the favorites and hidden recipes from disk.
+
+        A part with the wrong shape (for example a list instead of an
+        object) is ignored with a warning, so the integration still starts.
+        """
+        data = await self._store.async_load() or {}
+        if not isinstance(data, dict):
+            _LOGGER.warning("Ignoring the EatFresh store: it is not an object")
+            data = {}
+        favorites = _section(data, "favorites")
         self._favorites = {
-            key: value for key, value in favorites.items() if isinstance(value, dict)
+            str(key): value
+            for key, value in favorites.items()
+            if isinstance(value, dict)
+        }
+        hidden = _section(data, "hidden")
+        self._hidden = {
+            str(key): str(value) for key, value in hidden.items() if str(key).isdigit()
+        }
+        week_lists = _section(data, "week_lists")
+        self._week_lists = {
+            str(key): value
+            for key, value in week_lists.items()
+            if _is_iso_date(key) and isinstance(value, str)
+        }
+        week_list_done = _section(data, "week_list_done")
+        self._week_list_done = {
+            str(key): [str(item) for item in value if isinstance(item, str)]
+            for key, value in week_list_done.items()
+            if key in self._week_lists and isinstance(value, list)
         }
 
     @callback
     def _data_to_save(self) -> dict[str, Any]:
         """Return the data to write to disk."""
-        return {"favorites": dict(self._favorites)}
+        return {
+            "favorites": dict(self._favorites),
+            "hidden": dict(self._hidden),
+            "week_lists": dict(self._week_lists),
+            "week_list_done": {
+                key: list(value) for key, value in self._week_list_done.items()
+            },
+        }
 
     @callback
     def _schedule_save(self) -> None:
@@ -131,6 +207,101 @@ class FavoritesStore:
             return False
         self._schedule_save()
         return True
+
+    # ----- hidden recipes -----------------------------------------------
+
+    @callback
+    def is_hidden(self, kitchenowl_id: int | None) -> bool:
+        """Return True if a KitchenOwl recipe is hidden in EatFresh."""
+        return kitchenowl_id is not None and str(kitchenowl_id) in self._hidden
+
+    @callback
+    def hidden_ids(self) -> set[int]:
+        """Return the KitchenOwl ids of all hidden recipes."""
+        return {int(key) for key in self._hidden}
+
+    @callback
+    def async_hide(self, kitchenowl_id: int) -> bool:
+        """Hide a recipe in the collection. Return False if it was hidden."""
+        key = str(int(kitchenowl_id))
+        if key in self._hidden:
+            return False
+        self._hidden[key] = dt_util.utcnow().isoformat()
+        self._schedule_save()
+        return True
+
+    @callback
+    def async_unhide(self, kitchenowl_id: int) -> bool:
+        """Show a hidden recipe again. Return True if it was hidden."""
+        if self._hidden.pop(str(int(kitchenowl_id)), None) is None:
+            return False
+        self._schedule_save()
+        return True
+
+
+    # ----- shopping list of a week --------------------------------------
+
+    @callback
+    def week_list_time(self, week_start: date) -> str | None:
+        """Return when a week went to the shopping list (ISO time) or None."""
+        return self._week_lists.get(week_start.isoformat())
+
+    @callback
+    def week_list_done(self, week_start: date) -> set[str]:
+        """Return the planned entries of a week already sent after a partial try."""
+        return set(self._week_list_done.get(week_start.isoformat(), ()))
+
+    @callback
+    def async_set_week_list_time(
+        self, week_start: date, *, done: Iterable[str] | None = None
+    ) -> str:
+        """Remember that a week went to the shopping list now; return the time.
+
+        ``done`` lists the planned entries that went through when the
+        transfer stopped halfway; without it the week is complete.
+        """
+        when = dt_util.utcnow().isoformat()
+        key = week_start.isoformat()
+        # Set again at the end, so among equal times the newest comes last.
+        self._week_lists.pop(key, None)
+        self._week_lists[key] = when
+        if done:
+            self._week_list_done[key] = sorted(set(done))
+        else:
+            self._week_list_done.pop(key, None)
+        # Keep only the last transfers (by time, not by the day of the week):
+        # a week sent just now stays, however old it is.
+        newest = sorted(self._week_lists, key=self._week_lists.__getitem__)
+        for old in newest[:-MAX_WEEK_LISTS]:
+            del self._week_lists[old]
+            self._week_list_done.pop(old, None)
+        self._schedule_save()
+        return when
+
+
+def _section(data: dict[str, Any], name: str) -> dict[Any, Any]:
+    """Return one part of the stored data, or {} (with a warning) if broken."""
+    value = data.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _LOGGER.warning(
+            "Ignoring %s in the EatFresh store: expected an object, got %s",
+            name,
+            type(value).__name__,
+        )
+        return {}
+    return value
+
+
+def _is_iso_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return len(value) == 10
 
 
 class TTLCache[V]:

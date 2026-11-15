@@ -114,6 +114,26 @@
     },
     "shopping_list_partial": {
       "message": "Only {added_recipes} of {total} recipes reached the shopping list: {message}"
+    },
+    "not_in_collection": {
+      "message": "The recipe is not in the collection of this household."
+    }
+  },
+  "entity": {
+    "calendar": {
+      "week_plan": {
+        "name": "Week plan"
+      }
+    },
+    "sensor": {
+      "today": {
+        "name": "Today",
+        "state_attributes": {
+          "recipes": {
+            "name": "Recipes"
+          }
+        }
+      }
     }
   }
 }

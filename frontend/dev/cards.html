@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <link rel="icon" href="data:," />
+  <title>EatFresh Karten (Dev)</title>
+  <link rel="stylesheet" href="/frontend/dev/theme.css" />
+  <style>
+    /* A rough dashboard: columns of cards with the usual gaps. */
+    body { font-family: Roboto, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--primary-text-color); }
+    .dash { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 8px; padding: 8px; align-items: start; }
+    .col { display: grid; gap: 8px; min-width: 0; }
+    /* Stand-in for another Home Assistant card, to compare frame and type. */
+    .other {
+      background: var(--card-background-color); border: 1px solid var(--ha-card-border-color); border-radius: var(--ha-card-border-radius);
+      padding: 12px 16px 16px;
+    }
+    .other h2 { margin: 0 0 8px; font-size: 24px; font-weight: 400; line-height: 1.33; letter-spacing: -0.012em; }
+    .other .row { display: flex; justify-content: space-between; min-height: 40px; align-items: center; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <!-- Dev page for the dashboard cards, with the fake `hass` from dev/mock-hass.js. -->
+  <div class="dash">
+    <div class="col" id="c1"></div>
+    <div class="col" id="c2"></div>
+    <div class="col" id="c3"></div>
+  </div>
+  <script type="module">
+    import { createMock } from "/frontend/dev/mock-hass.js";
+    const params = new URLSearchParams(location.search);
+    const { hass, dark } = createMock(params);
+    if (dark) document.documentElement.dataset.theme = "dark";
+    await import("/custom_components/eatfresh/frontend/eatfresh-cards.js");
+
+    const other = () => {
+      const el = document.createElement("div");
+      el.className = "other";
+      el.innerHTML = `<h2>Wohnzimmer</h2><div class="row"><span>Temperatur</span><span>21,5 °C</span></div><div class="row"><span>Luftfeuchte</span><span>48 %</span></div>`;
+      return el;
+    };
+    const card = (type, config) => {
+      const el = document.createElement(type);
+      el.setConfig(config);
+      el.hass = hass;
+      return el;
+    };
+    const days = Number(params.get("days") ?? 7);
+    document.getElementById("c1").append(card("eatfresh-today-card", {}), other());
+    document.getElementById("c2").append(card("eatfresh-week-card", { days }));
+    document.getElementById("c3").append(other(), card("eatfresh-week-card", { title: "Nächste 3 Tage", days: 3 }));
+
+    window.navigations = [];
+    window.addEventListener("location-changed", () => window.navigations.push(location.pathname));
+  </script>
+</body>
+</html>

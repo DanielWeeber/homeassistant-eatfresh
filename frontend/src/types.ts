@@ -4,6 +4,7 @@ export interface HomeAssistant {
   language?: string;
   locale?: { language?: string };
   themes?: { darkMode?: boolean };
+  config?: { time_zone?: string };
   callWS<T>(msg: Record<string, unknown>): Promise<T>;
 }
 
@@ -74,6 +75,51 @@ export interface CollectionRecipe {
   source: string | null;
   time: number | null;
   yields: number | null;
+  tags: string[];
+  hidden: boolean;
+}
+
+/** Answer of `eatfresh/collection/recipe` (read from KitchenOwl only). */
+export interface CollectionRecipeResponse {
+  recipe: Recipe;
+  kitchenowl_id: number;
+  tags: string[];
+  hidden: boolean;
+}
+
+export interface TagsResponse {
+  categories: string[];
+  tags: string[];
+}
+
+export interface PlannerEntry {
+  kitchenowl_id: number;
+  name: string;
+  image: string | null;
+}
+
+export interface PlannerDay {
+  date: string;
+  entries: PlannerEntry[];
+}
+
+export interface PlannerResponse {
+  week_start: string;
+  /** Today in the time zone of Home Assistant. */
+  today: string;
+  days: PlannerDay[];
+  unscheduled: PlannerEntry[];
+  /** When the week went to the shopping list (ISO time), on any device. */
+  shopping_list_at?: string | null;
+}
+
+export interface WeekShoppingResponse {
+  added: number;
+  recipes: number;
+  /** Time of this transfer. */
+  at?: string | null;
+  /** Set instead when the week went to the list before; nothing was sent. */
+  already_added_at?: string;
 }
 
 export interface WsError {
@@ -83,7 +129,11 @@ export interface WsError {
   translation_placeholders?: Record<string, string>;
 }
 
+export type Tab = "search" | "collection" | "planner";
+
 export type View =
   | { name: "search" }
   | { name: "collection" }
-  | { name: "recipe"; key?: string; url?: string };
+  | { name: "planner" }
+  | { name: "recipe"; key?: string; url?: string }
+  | { name: "korecipe"; id: number };

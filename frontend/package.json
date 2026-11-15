@@ -1,8 +1,8 @@
 {
   "name": "eatfresh-panel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Sidebar panel for the EatFresh Home Assistant integration",
+  "description": "Sidebar panel and dashboard cards for the EatFresh Home Assistant integration",
   "license": "MIT",
   "type": "module",
   "scripts": {

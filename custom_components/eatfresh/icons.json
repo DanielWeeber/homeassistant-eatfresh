@@ -1,4 +1,16 @@
 {
+  "entity": {
+    "calendar": {
+      "week_plan": {
+        "default": "mdi:calendar-week"
+      }
+    },
+    "sensor": {
+      "today": {
+        "default": "mdi:silverware-fork-knife"
+      }
+    }
+  },
   "services": {
     "import_recipe": {
       "service": "mdi:book-plus"

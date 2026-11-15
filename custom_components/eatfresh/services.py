@@ -20,8 +20,15 @@ from .const import (
     SERVICE_ADD_TO_SHOPPING_LIST,
     SERVICE_IMPORT_RECIPE,
 )
-from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, SourceBlocked
+from .errors import (
+    EatFreshError,
+    KitchenOwlAuthError,
+    KitchenOwlError,
+    RecipeNotFound,
+    SourceBlocked,
+)
 from .runtime import (
+    NOT_IN_COLLECTION,
     EatFreshData,
     async_reauth_on_auth_error,
     error_message,
@@ -45,6 +52,10 @@ def _require_data(hass: HomeAssistant) -> EatFreshData:
 
 def _ha_error(err: EatFreshError) -> HomeAssistantError:
     """Turn an EatFresh error into a Home Assistant error."""
+    if isinstance(err, RecipeNotFound) and str(err) == NOT_IN_COLLECTION:
+        return ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_in_collection"
+        )
     if isinstance(err, KitchenOwlAuthError):
         key = "kitchenowl_auth"
     elif isinstance(err, KitchenOwlError):

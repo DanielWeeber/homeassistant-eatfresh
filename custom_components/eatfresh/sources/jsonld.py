@@ -10,12 +10,14 @@ import asyncio
 from functools import partial
 import json
 import re
+from html import unescape
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..errors import RecipeNotFound
 from ..ingredients import parse_ingredient
+from ..kitchenowl import normalize_source
 from ..models import Ingredient, Recipe, SearchHit
 from .base import RecipeSource, first_int, host_of, html_to_text
 
@@ -33,14 +35,21 @@ EXECUTOR_MIN_CHARS = 256_000
 
 
 class _LdScriptParser(HTMLParser):
-    """Collect the text of all ``application/ld+json`` script elements."""
+    """Collect all ``application/ld+json`` scripts and the canonical link."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
         self.blocks: list[str] = []
+        self.canonical: str | None = None
         self._current: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "link" and self.canonical is None:
+            rel = next((v or "" for k, v in attrs if k == "rel"), "")
+            href = next((v for k, v in attrs if k == "href"), None)
+            if "canonical" in rel.lower().split() and href and href.strip():
+                self.canonical = unescape(href.strip())
+            return
         if tag != "script":
             return
         kind = next((v or "" for k, v in attrs if k == "type"), "")
@@ -81,6 +90,11 @@ def parse_duration(value: object) -> int | None:
 
 
 def _iter_json_blocks(html_text: str) -> list[Any]:
+    return _parse_page(html_text)[0]
+
+
+def _parse_page(html_text: str) -> tuple[list[Any], str | None]:
+    """Return the JSON-LD documents and the canonical link of a page."""
     parser = _LdScriptParser()
     try:
         parser.feed(html_text)
@@ -96,7 +110,7 @@ def _iter_json_blocks(html_text: str) -> list[Any]:
             documents.append(json.loads(text, strict=False))
         except ValueError:
             continue
-    return documents
+    return documents, parser.canonical
 
 
 def _has_type(node: dict[str, Any], wanted: str) -> bool:
@@ -127,8 +141,17 @@ def find_recipe_node(html_text: str) -> tuple[dict[str, Any], dict[str, dict[str
     Returns the recipe node and an index of all nodes by ``@id`` (to resolve
     references such as images), or None if the page holds no recipe.
     """
+    found = _find_recipe(html_text)
+    return None if found is None else (found[0], found[1])
+
+
+def _find_recipe(
+    html_text: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str | None] | None:
+    """Like :func:`find_recipe_node`, plus the canonical link of the page."""
+    documents, canonical = _parse_page(html_text)
     nodes: list[dict[str, Any]] = []
-    for document in _iter_json_blocks(html_text):
+    for document in documents:
         _walk(document, nodes)
     index = {
         node["@id"]: node
@@ -140,7 +163,51 @@ def find_recipe_node(html_text: str) -> tuple[dict[str, Any], dict[str, dict[str
         return None
     # Prefer a node that really carries ingredients.
     candidates.sort(key=lambda node: 0 if node.get("recipeIngredient") else 1)
-    return candidates[0], index
+    return candidates[0], index, canonical
+
+
+def _same_site(host: str, other: str) -> bool:
+    """Return True if two hosts are equal, a leading ``www.`` aside."""
+    return bool(host) and host.removeprefix("www.") == other.removeprefix("www.")
+
+
+def canonical_address(
+    url: str,
+    canonical: str | None,
+    node: dict[str, Any] | None = None,
+) -> str:
+    """Return the canonical address of a recipe page, or ``url``.
+
+    Candidates in this order: ``<link rel="canonical">``, then ``url`` and
+    ``mainEntityOfPage`` of the recipe data. A candidate counts only if it
+    is an http(s) address on the same host as ``url`` (``www.`` aside), so a
+    page cannot point the recipe at another site, and only if it names the
+    same page: after :func:`normalize_source` host, path and the remaining
+    query parameters must be equal. A start page, an overview or parent
+    page or any other path (a wrongly set up plugin) is never taken over;
+    otherwise all recipes of a site would get one address and a heart would
+    find the wrong recipe.
+    """
+    candidates: list[Any] = [canonical]
+    if node is not None:
+        candidates.append(node.get("url"))
+        page = node.get("mainEntityOfPage")
+        if isinstance(page, dict):
+            page = page.get("@id") or page.get("url")
+        candidates.append(page)
+    host = host_of(url)
+    page_address = normalize_source(url)
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        absolute = urljoin(url, candidate.strip())
+        if urlsplit(absolute).scheme not in ("http", "https"):
+            continue
+        if _same_site(host_of(absolute), host) and (
+            normalize_source(absolute) == page_address
+        ):
+            return absolute
+    return url
 
 
 def _resolve(value: Any, index: dict[str, dict[str, Any]]) -> Any:
@@ -202,9 +269,24 @@ def _steps(value: Any, index: dict[str, dict[str, Any]]) -> list[str]:
     return []
 
 
-def _tags(node: dict[str, Any]) -> list[str]:
+# schema.org ``suitableForDiet`` values that EatFresh turns into a tag.
+_DIET_TAGS = {"vegandiet": "Vegan", "vegetariandiet": "Vegetarian"}
+
+
+def _diet_tags(node: dict[str, Any]) -> list[str]:
+    """Return "Vegan"/"Vegetarian" when the recipe data names that diet."""
     tags: list[str] = []
-    seen: set[str] = set()
+    for entry in _text_list(node.get("suitableForDiet")):
+        name = entry.strip().rstrip("/").rsplit("/", 1)[-1].lower()
+        if (tag := _DIET_TAGS.get(name)) is not None and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _tags(node: dict[str, Any]) -> list[str]:
+    # The diet comes first, so the limit never cuts it off.
+    tags: list[str] = _diet_tags(node)
+    seen: set[str] = {tag.lower() for tag in tags}
     for field in ("recipeCategory", "recipeCuisine", "keywords"):
         for entry in _text_list(node.get(field)):
             for part in html_to_text(entry).split(","):
@@ -275,22 +357,45 @@ def _first_text(value: Any) -> str | None:
 
 
 def recipe_from_html(
-    html_text: str, *, source: str, recipe_id: str, url: str
+    html_text: str,
+    *,
+    source: str,
+    recipe_id: str,
+    url: str,
+    canonical: bool = False,
 ) -> Recipe:
-    """Read the JSON-LD recipe of a page. Raises ``RecipeNotFound`` if none."""
-    found = find_recipe_node(html_text)
+    """Read the JSON-LD recipe of a page. Raises ``RecipeNotFound`` if none.
+
+    With ``canonical`` (a pasted link) the recipe address becomes the
+    canonical address of the page (see :func:`canonical_address`), so the
+    same page pasted with tracking parameters or another spelling is saved
+    only once.
+    """
+    found = _find_recipe(html_text)
     if found is None:
         raise RecipeNotFound("The page holds no recipe data")
-    node, index = found
+    node, index, link = found
+    if canonical:
+        url = canonical_address(url, link, node)
     return recipe_from_node(node, index, source=source, recipe_id=recipe_id, url=url)
 
 
 async def async_recipe_from_html(
-    html_text: str, *, source: str, recipe_id: str, url: str
+    html_text: str,
+    *,
+    source: str,
+    recipe_id: str,
+    url: str,
+    canonical: bool = False,
 ) -> Recipe:
     """Like :func:`recipe_from_html`, but large pages are parsed off the loop."""
     parse = partial(
-        recipe_from_html, html_text, source=source, recipe_id=recipe_id, url=url
+        recipe_from_html,
+        html_text,
+        source=source,
+        recipe_id=recipe_id,
+        url=url,
+        canonical=canonical,
     )
     if len(html_text) < EXECUTOR_MIN_CHARS:
         return parse()
@@ -330,4 +435,6 @@ class JsonLdSource(RecipeSource):
         # HttpClient refuses addresses in private networks (DNS checked,
         # every redirect checked again).
         page = await self._client.get_text(url)
-        return await async_recipe_from_html(page, source=self.id, recipe_id=url, url=url)
+        return await async_recipe_from_html(
+            page, source=self.id, recipe_id=url, url=url, canonical=True
+        )

@@ -134,3 +134,74 @@ def test_enabled_source_ids() -> None:
         {CONF_SOURCES: ["chefkoch", "nope"], CONF_ACCEPT_CHEFKOCH: True},
         FAKE_CLASSES,
     ) == ["chefkoch"]
+
+
+async def test_store_upgrades_file_of_version_0_1_0(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A file written by EatFresh 0.1.0 keeps all favorites and gains hidden."""
+    favorite = {
+        "source": "fakea",
+        "id": "r1",
+        "url": "https://recipes.example.com/fakea/r1",
+        "title": "Soup",
+        "image": None,
+        "kitchenowl_id": 11,
+        "added_at": "2026-11-01T10:00:00+00:00",
+    }
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORAGE_KEY,
+        "data": {"favorites": {"fakea:r1": favorite}},
+    }
+    store = FavoritesStore(hass)
+    await store.async_load()
+    assert store.get("fakea:r1") == favorite
+    assert store.hidden_ids() == set()
+
+    assert store.async_hide(12)
+    assert not store.async_hide(12)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+    await hass.async_block_till_done()
+    saved = hass_storage[STORAGE_KEY]
+    assert saved["version"] == 1
+    assert saved["minor_version"] == 2
+    assert saved["data"]["favorites"] == {"fakea:r1": favorite}
+    assert list(saved["data"]["hidden"]) == ["12"]
+
+    again = FavoritesStore(hass)
+    await again.async_load()
+    assert again.is_hidden(12)
+    assert not again.is_hidden(11)
+    assert again.get("fakea:r1") == favorite
+
+
+async def test_store_hide_and_unhide(hass: HomeAssistant) -> None:
+    store = FavoritesStore(hass)
+    await store.async_load()
+    assert not store.is_hidden(None)
+    assert store.async_hide(5)
+    assert store.is_hidden(5)
+    assert store.async_unhide(5)
+    assert not store.async_unhide(5)
+    assert not store.is_hidden(5)
+
+
+async def test_store_ignores_broken_hidden(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 2,
+        "key": STORAGE_KEY,
+        "data": {"favorites": {}, "hidden": {"7": "t", "x": "t", "-1": "t"}},
+    }
+    store = FavoritesStore(hass)
+    await store.async_load()
+    assert store.hidden_ids() == {7}
+
+    hass_storage[STORAGE_KEY]["data"]["hidden"] = ["7"]
+    store = FavoritesStore(hass)
+    await store.async_load()
+    assert store.hidden_ids() == set()

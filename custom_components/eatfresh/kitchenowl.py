@@ -1,6 +1,7 @@
 """Client for the KitchenOwl REST API (tested against KitchenOwl 0.8.1).
 
-Pure Python: no Home Assistant imports. The client never deletes anything.
+Pure Python: no Home Assistant imports. The client never deletes recipes,
+items or lists; the only DELETE it sends removes a meal plan entry.
 
 Facts taken from the KitchenOwl 0.8.1 backend source:
 
@@ -12,6 +13,10 @@ Facts taken from the KitchenOwl 0.8.1 backend source:
   failed download silently leaves the recipe without a photo.
 * Shopping list entries are merged by ``description_merger``. See
   :func:`item_description` for the format it understands.
+* ``POST /api/recipe/<id>`` changes only the fields that are sent; ``tags``
+  replaces the tag links (names, case sensitive, created when missing).
+* The meal plan (``/api/household/<id>/planner``) stores a real date per
+  entry. See :meth:`KitchenOwlClient.list_planner`.
 """
 
 from __future__ import annotations
@@ -19,12 +24,13 @@ from __future__ import annotations
 import math
 import re
 import time
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 import aiohttp
 
-from .errors import KitchenOwlAuthError, KitchenOwlError
+from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, RecipeNotFound
 from .models import Ingredient, Recipe
 
 REQUEST_TIMEOUT = 20  # seconds
@@ -63,6 +69,8 @@ _COUNT_UNITS = frozenset(
     {"x", "stk", "stk.", "stück", "stueck", "st", "st.", "piece", "pieces", "pc", "pcs"}
 )
 _STEP_NUMBER = re.compile(r"^\s*(?:schritt|step)?\s*\d+\s*[.):]\s*", re.IGNORECASE)
+_NUMBERED_LINE = re.compile(r"^\s*(?:schritt|step)?\s*\d+\s*[.):]\s+(.*)$", re.IGNORECASE)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _AUTH_HINT = re.compile(r"token|segments|authorization|signature|jwt|subject", re.I)
 
 
@@ -129,16 +137,89 @@ def item_description(ingredient: Ingredient) -> str:
     return ", ".join(parts)
 
 
+# Query parameters that only track where a click came from. They never change
+# the recipe, so ``normalize_source`` drops them.
+_TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "gclsrc",
+        "dclid",
+        "gbraid",
+        "wbraid",
+        "msclkid",
+        "yclid",
+        "twclid",
+        "ttclid",
+        "igshid",
+        "igsh",
+        "li_fat_id",
+        "mc_cid",
+        "mc_eid",
+        "mkt_tok",
+        "_ga",
+        "_gl",
+        "_hsenc",
+        "_hsmi",
+        "oly_anon_id",
+        "oly_enc_id",
+        "vero_id",
+        "s_cid",
+        "ncid",
+        "amp",
+        # Share buttons and referrers ("?ref=pin", "?share=1"). Parameters
+        # that can name a recipe ("id", "p", "s" and unknown ones) stay.
+        "ref",
+        "share",
+    }
+)
+_TRACKING_PREFIXES = ("utm_", "pk_", "mtm_", "hsa_")
+_DEFAULT_PORTS = {":80", ":443"}
+
+
+def _is_tracking(name: str) -> bool:
+    key = name.strip().lower()
+    return key in _TRACKING_PARAMS or key.startswith(_TRACKING_PREFIXES)
+
+
 def normalize_source(url: str) -> str:
     """Return a comparable form of a recipe address.
 
-    Ignores http/https, case of the host, a trailing slash and the fragment.
+    Two spellings of the same page give the same text: the scheme (http,
+    https or none), the case of the host, a leading ``www.``, a default
+    port, a trailing slash, an ``amp`` path segment at the start or the end
+    (AMP pages), percent encoding in the path (``k%C3%BCrbis`` is
+    ``kürbis``), the fragment and tracking parameters (``utm_*``,
+    ``fbclid``, ``gclid``, ``ref``, ``share`` and the like) do not matter.
+    Other query parameters are kept, in sorted order.
     """
     text = url.strip()
+    if not text:
+        return ""
     parts = urlsplit(text if "//" in text else f"//{text}")
-    path = parts.path.rstrip("/")
-    query = f"?{parts.query}" if parts.query else ""
-    return f"{parts.netloc.lower()}{path}{query}"
+    host = parts.netloc.rsplit("@", 1)[-1].lower().rstrip(".")
+    for port in _DEFAULT_PORTS:
+        if host.endswith(port):
+            host = host[: -len(port)]
+    host = host.removeprefix("www.")
+    # Decode each segment on its own; an encoded slash stays "%2F".
+    segments = [
+        unquote(segment).replace("/", "%2F")
+        for segment in parts.path.split("/")
+        if segment
+    ]
+    if segments and segments[-1].lower() == "amp":
+        segments.pop()
+    if segments and segments[0].lower() == "amp":
+        segments.pop(0)
+    path = "/" + "/".join(segments) if segments else ""
+    params = sorted(
+        (name, value)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not _is_tracking(name)
+    )
+    query = f"?{urlencode(params)}" if params else ""
+    return f"{host}{path}{query}"
 
 
 def _minutes(value: int | None) -> int | None:
@@ -183,6 +264,132 @@ def _build_items(ingredients: list[Ingredient]) -> list[dict[str, Any]]:
                 part for part in (entry["description"], description) if part
             )
     return list(merged.values())
+
+
+def _clean_tags(tags: list[str]) -> list[str]:
+    """Return tag names trimmed and without duplicates (case-insensitive)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            continue
+        name = " ".join(tag.split())
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            result.append(name)
+    return result
+
+
+def _tag_names(raw: Any) -> list[str]:
+    """Return tag names from KitchenOwl's ``[{id, name, ...}]``."""
+    if not isinstance(raw, list):
+        return []
+    names = [t.get("name") for t in raw if isinstance(t, dict)]
+    return _clean_tags([n for n in names if isinstance(n, str)])
+
+
+def _day_to_ms(day: date) -> int:
+    """Return midnight UTC of ``day`` in milliseconds (KitchenOwl's format)."""
+    midnight = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    return (midnight - _EPOCH) // timedelta(milliseconds=1)
+
+
+def _ms_to_day(value: Any) -> date | None:
+    """Return the date of a ``cooking_date``; ``None`` for "no day"."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < -2_208_988_800_000:  # before 1900, covers the "no day" value
+        return None
+    try:
+        return (_EPOCH + timedelta(milliseconds=value)).date()
+    except OverflowError:
+        return None
+
+
+def _split_description(text: str) -> tuple[str | None, list[str]]:
+    """Split a KitchenOwl description into (text before the steps, steps).
+
+    EatFresh writes a short text, a blank line and numbered lines. Everything
+    before the first numbered line is the text; each numbered line starts a
+    step, following lines up to a blank line belong to it, and a paragraph
+    after a blank line becomes a step of its own. Without numbered lines
+    (a recipe written in the KitchenOwl app) every paragraph is one step.
+    Nothing is dropped: only the numbers are removed.
+    """
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    first = next((i for i, line in enumerate(lines) if _NUMBERED_LINE.match(line)), None)
+    if first is None:
+        paragraphs = [
+            "\n".join(part.strip() for part in block.split("\n") if part.strip())
+            for block in re.split(r"\n\s*\n", "\n".join(lines))
+        ]
+        return None, [p for p in paragraphs if p]
+    before = "\n".join(lines[:first]).strip()
+    steps: list[list[str]] = []
+    blank_before = False
+    for line in lines[first:]:
+        if not line.strip():
+            blank_before = True
+            continue
+        match = _NUMBERED_LINE.match(line)
+        if match:
+            steps.append([match.group(1).strip()])
+        elif blank_before or not steps:
+            steps.append([line.strip()])
+        else:
+            steps[-1].append(line.strip())
+        blank_before = False
+    return before or None, [" ".join(part for part in step if part) for step in steps]
+
+
+def _positive_minutes(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value > 0 else None
+
+
+def recipe_to_model(data: dict) -> Recipe:
+    """Turn a KitchenOwl recipe (from ``get_recipe``) into a :class:`Recipe`.
+
+    ``source`` is ``"kitchenowl"`` and ``id`` the KitchenOwl recipe id. The
+    description is split into text and numbered steps (see
+    :func:`_split_description`). Ingredients keep name and the KitchenOwl
+    description as ``raw`` (``"<description> <name>"``); amount and unit are
+    not parsed. Whether an ingredient is optional is not carried over.
+    """
+    try:
+        recipe_id = int(data["id"])
+    except (KeyError, TypeError, ValueError) as err:
+        raise KitchenOwlError("KitchenOwl recipe has no id") from err
+    description, steps = _split_description(str(data.get("description") or ""))
+    ingredients: list[Ingredient] = []
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split())
+        if not name:
+            continue
+        note = " ".join(str(item.get("description") or "").split())
+        ingredients.append(
+            Ingredient(name=name, raw=f"{note} {name}" if note else name)
+        )
+    photo = data.get("photo")
+    source = data.get("source")
+    return Recipe(
+        source="kitchenowl",
+        id=str(recipe_id),
+        url=source.strip() if isinstance(source, str) else "",
+        title=" ".join(str(data.get("name") or "").split()),
+        description=description,
+        image=photo if isinstance(photo, str) and photo else None,
+        servings=_positive_minutes(data.get("yields")),
+        prep_time=_positive_minutes(data.get("prep_time")),
+        cook_time=_positive_minutes(data.get("cook_time")),
+        total_time=_positive_minutes(data.get("time")),
+        ingredients=ingredients,
+        steps=steps,
+        tags=_tag_names(data.get("tags")),
+    )
 
 
 class KitchenOwlClient:
@@ -246,7 +453,12 @@ class KitchenOwlClient:
             raise KitchenOwlError(f"KitchenOwl not reachable ({path}): {err}") from err
 
     @staticmethod
-    def _error_for(status: int, path: str, body: str) -> KitchenOwlError:
+    def _error_for(status: int, path: str, body: str) -> EatFreshError:
+        # KitchenOwl answers 403 for a recipe of a household the user of the
+        # token is not in. The token is fine, so this is no reason to log in
+        # again.
+        if status == 403 and path.startswith("/api/recipe/"):
+            return RecipeNotFound(f"KitchenOwl refused the recipe ({path})")
         # flask-jwt-extended answers 422 for a malformed token.
         if status in (401, 403) or (status == 422 and _AUTH_HINT.search(body)):
             return KitchenOwlAuthError(f"KitchenOwl rejected the token (HTTP {status})")
@@ -278,7 +490,10 @@ class KitchenOwlClient:
         return [{"id": item["id"], "name": item.get("name", "")} for item in data]
 
     async def list_recipes(self, household_id: int) -> list[dict]:
-        """Return all recipes of a household, reduced to the fields we use."""
+        """Return all recipes of a household, reduced to the fields we use.
+
+        Fields: id, name, source, photo, time, yields and ``tags`` (names).
+        """
         path = f"/api/household/{int(household_id)}/recipe"
         data = self._expect(await self._request("GET", path), list, path)
         recipes = [
@@ -289,11 +504,12 @@ class KitchenOwlClient:
                 "photo": item.get("photo"),
                 "time": item.get("time"),
                 "yields": item.get("yields"),
+                "tags": _tag_names(item.get("tags")),
             }
             for item in data
         ]
         self._recipe_lists[int(household_id)] = (time.monotonic(), recipes)
-        return [dict(item) for item in recipes]
+        return [{**item, "tags": list(item["tags"])} for item in recipes]
 
     async def _cached_recipes(self, household_id: int) -> list[dict]:
         """Return the recipe list, reusing a copy younger than RECIPE_LIST_TTL."""
@@ -301,6 +517,25 @@ class KitchenOwlClient:
         if cached is not None and time.monotonic() - cached[0] < RECIPE_LIST_TTL:
             return cached[1]
         return await self.list_recipes(household_id)
+
+    async def recipe_ids(self, household_id: int, *, fresh: bool = False) -> set[int]:
+        """Return the ids of all recipes of a household.
+
+        Reuses the recipe list for a short time (see ``RECIPE_LIST_TTL``);
+        with ``fresh`` it is always loaded again.
+        """
+        recipes = (
+            await self.list_recipes(household_id)
+            if fresh
+            else await self._cached_recipes(household_id)
+        )
+        ids: set[int] = set()
+        for recipe in recipes:
+            try:
+                ids.add(int(recipe["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return ids
 
     def forget_recipes(self, household_id: int | None = None) -> None:
         """Drop the cached recipe list (of one household or of all)."""
@@ -313,6 +548,95 @@ class KitchenOwlClient:
         """Return one full recipe (``GET /api/recipe/<id>``)."""
         path = f"/api/recipe/{int(recipe_id)}"
         return self._expect(await self._request("GET", path), dict, path)
+
+    async def list_tags(self, household_id: int) -> list[str]:
+        """Return the names of all tags of a household (``GET .../tag``)."""
+        path = f"/api/household/{int(household_id)}/tag"
+        data = self._expect(await self._request("GET", path), list, path)
+        return _tag_names(data)
+
+    async def set_recipe_tags(self, recipe_id: int, tags: list[str]) -> list[str]:
+        """Replace the tags of a recipe and return the names now stored.
+
+        Sends only ``tags`` to ``POST /api/recipe/<id>``; KitchenOwl leaves
+        every other field (name, description, items, times, source, photo)
+        as it is, creates missing tags and unlinks tags not in the list.
+        Names are trimmed and duplicates (any case) dropped. Does not delete
+        the tags themselves.
+        """
+        names = _clean_tags(list(tags))
+        path = f"/api/recipe/{int(recipe_id)}"
+        # The cached recipe list carries tags, so it is out of date now.
+        self.forget_recipes()
+        try:
+            data = self._expect(
+                await self._request("POST", path, json={"tags": names}), dict, path
+            )
+        finally:
+            self.forget_recipes()
+        return _tag_names(data.get("tags"))
+
+    async def list_planner(self, household_id: int) -> list[dict]:
+        """Return the meal plan as ``[{recipe_id, name, photo, date}]``.
+
+        KitchenOwl 0.8.1 stores one row per recipe and day: ``cooking_date``
+        is a timestamp (ms) of midnight UTC of a real date, so the date is
+        that timestamp read in UTC. A recipe can be planned on several days.
+        A recipe planned without a day is stored as 0001-01-01; it comes
+        back with ``date`` set to ``None``. (The ``day`` weekday number the
+        server also sends is ignored: it is -1 for anything after a week.)
+        """
+        path = f"/api/household/{int(household_id)}/planner"
+        data = self._expect(await self._request("GET", path), list, path)
+        entries: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            recipe = item.get("recipe") if isinstance(item.get("recipe"), dict) else {}
+            try:
+                recipe_id = int(item.get("recipe_id", recipe.get("id")))
+            except (TypeError, ValueError):
+                continue
+            entries.append(
+                {
+                    "recipe_id": recipe_id,
+                    "name": recipe.get("name") or "",
+                    "photo": recipe.get("photo") or None,
+                    "date": _ms_to_day(item.get("cooking_date")),
+                }
+            )
+        return entries
+
+    async def add_planner_entry(
+        self, household_id: int, recipe_id: int, day: date
+    ) -> None:
+        """Plan a recipe on a day (``POST .../planner/recipe``).
+
+        ``day`` is sent as midnight UTC, the way KitchenOwl stores it.
+        Planning the same recipe on the same day again changes nothing; a
+        recipe that was planned without a day loses that entry (the server
+        replaces it).
+        """
+        if not isinstance(day, date) or isinstance(day, datetime):
+            raise KitchenOwlError("The planner needs a date")
+        path = f"/api/household/{int(household_id)}/planner/recipe"
+        body = {"recipe_id": int(recipe_id), "cooking_date": _day_to_ms(day)}
+        await self._request("POST", path, json=body)
+
+    async def remove_planner_entry(
+        self, household_id: int, recipe_id: int, day: date | None
+    ) -> None:
+        """Take a recipe out of the meal plan; the recipe itself stays.
+
+        With ``day`` only that day's entry goes; with ``None`` only the entry
+        without a day (other days stay). Removing an entry that does not
+        exist is not an error. This is the only DELETE the client sends.
+        """
+        if day is not None and (not isinstance(day, date) or isinstance(day, datetime)):
+            raise KitchenOwlError("The planner needs a date")
+        path = f"/api/household/{int(household_id)}/planner/recipe/{int(recipe_id)}"
+        body: dict[str, Any] = {} if day is None else {"cooking_date": _day_to_ms(day)}
+        await self._request("DELETE", path, json=body)
 
     async def find_by_source(
         self, household_id: int, url: str, *, fresh: bool = False
