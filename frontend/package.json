@@ -1,0 +1,26 @@
+{
+  "name": "eatfresh-panel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sidebar panel for the EatFresh Home Assistant integration",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && rollup -c",
+    "typecheck": "tsc --noEmit",
+    "watch": "rollup -c -w",
+    "serve": "node dev/serve.mjs"
+  },
+  "dependencies": {
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "@mdi/js": "^7.4.47",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "@rollup/plugin-typescript": "^12.3.1",
+    "rollup": "^4.68.3",
+    "tslib": "^2.9.1",
+    "typescript": "^5.9.3"
+  }
+}

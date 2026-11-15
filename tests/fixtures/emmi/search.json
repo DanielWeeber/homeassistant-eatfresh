@@ -1,0 +1,33 @@
+[
+  {
+    "id": 5001,
+    "link": "https://emmikochteinfach.de/beispiel-gulaschsuppe/",
+    "title": {
+      "rendered": "Beispiel-Gulaschsuppe &#8211; herzhaft"
+    },
+    "yoast_head_json": {
+      "title": "Beispiel-Gulaschsuppe &#8211; herzhaft",
+      "og_locale": "de_DE",
+      "og_image": [
+        {
+          "width": 1170,
+          "height": 780,
+          "url": "https://emmikochteinfach.de/wp-content/uploads/2026/01/Beispiel-Gulaschsuppe-1.jpg",
+          "type": "image/jpeg"
+        }
+      ]
+    }
+  },
+  {
+    "id": 5002,
+    "link": "https://emmikochteinfach.de/beispiel-ratgeber-vorratsschrank/",
+    "title": {
+      "rendered": "Ratgeber: Der Vorratsschrank"
+    },
+    "yoast_head_json": {
+      "title": "Ratgeber: Der Vorratsschrank",
+      "og_locale": "de_DE",
+      "og_image": []
+    }
+  }
+]

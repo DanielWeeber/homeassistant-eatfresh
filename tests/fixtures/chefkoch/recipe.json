@@ -1,0 +1,63 @@
+{
+  "id": "100000000000001",
+  "type": 0,
+  "title": "Beispiel-Kartoffelsuppe",
+  "subtitle": "Eine erfundene Suppe",
+  "previewImageId": "90001",
+  "previewImageUrlTemplate": "https://img.chefkoch-cdn.de/rezepte/100000000000001/bilder/90001/<format>/beispiel-100000000000001.jpg",
+  "preparationTime": 20,
+  "cookingTime": 30,
+  "restingTime": 0,
+  "totalTime": 50,
+  "servings": 4,
+  "isPlus": false,
+  "instructions": "Kartoffeln schälen und würfeln.\n\nMit Brühe 30 Minuten kochen.\n\nAbschmecken und servieren.",
+  "tags": [
+    "Hauptspeise",
+    "Eintopf",
+    "Eintopf"
+  ],
+  "siteUrl": "https://www.chefkoch.de/rezepte/100000000000001/Beispiel-100000000000001.html",
+  "ingredientGroups": [
+    {
+      "header": " ",
+      "ingredients": [
+        {
+          "id": "1",
+          "name": "Kartoffel(n)",
+          "unit": "kg",
+          "amount": 1.0,
+          "usageInfo": "mehlig kochend"
+        },
+        {
+          "id": "2",
+          "name": "Suppengemüse",
+          "unit": "Bund",
+          "amount": 1.0,
+          "usageInfo": ""
+        },
+        {
+          "id": "3",
+          "name": "Brühe",
+          "unit": "Liter",
+          "amount": 1.5,
+          "usageInfo": ""
+        },
+        {
+          "id": "4",
+          "name": "Salz und Pfeffer",
+          "unit": "",
+          "amount": 0.0,
+          "usageInfo": ""
+        },
+        {
+          "id": "5",
+          "name": "Würstchen",
+          "unit": "",
+          "amount": 2.0,
+          "usageInfo": ""
+        }
+      ]
+    }
+  ]
+}

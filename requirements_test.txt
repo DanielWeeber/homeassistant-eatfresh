@@ -1,0 +1,4 @@
+# Test dependencies. Keep pytest-homeassistant-custom-component in step with
+# the Home Assistant version it pins.
+pytest-homeassistant-custom-component==0.13.375
+aioresponses==0.7.9

@@ -1,0 +1,119 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect KitchenOwl",
+        "description": "EatFresh saves recipes in KitchenOwl and puts ingredients on your shopping list. Enter the address of your KitchenOwl server and a long-lived access token (KitchenOwl: Settings > Sessions > Long-lived tokens).",
+        "data": {
+          "url": "KitchenOwl address",
+          "token": "Access token"
+        },
+        "data_description": {
+          "url": "Address of your KitchenOwl server, for example {example_url}",
+          "token": "The token is stored in Home Assistant and never shown again."
+        }
+      },
+      "household": {
+        "title": "Choose household",
+        "description": "Recipes are saved in this KitchenOwl household.",
+        "data": {
+          "household_id": "Household"
+        }
+      },
+      "shoppinglist": {
+        "title": "Choose shopping list",
+        "description": "Ingredients go onto this shopping list.",
+        "data": {
+          "shoppinglist_id": "Shopping list"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Renew KitchenOwl access",
+        "description": "KitchenOwl rejected the access token. Enter a new long-lived access token.",
+        "data": {
+          "token": "Access token"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Enter a full address starting with http:// or https://.",
+      "invalid_auth": "KitchenOwl rejected the access token.",
+      "cannot_connect": "KitchenOwl cannot be reached at this address.",
+      "no_households": "This account has no household in KitchenOwl.",
+      "no_shoppinglists": "This household has no shopping list in KitchenOwl.",
+      "unknown": "Unexpected error. See the log for details."
+    },
+    "abort": {
+      "already_configured": "EatFresh is already set up for this household.",
+      "single_instance_allowed": "EatFresh is already set up. Only one setup is possible.",
+      "invalid_auth": "KitchenOwl rejected the access token.",
+      "reauth_successful": "The access token was renewed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Recipe sources",
+        "description": "Choose the websites EatFresh searches. Pasting a recipe link always works. EatFresh only loads a page when you search or open a recipe.\n\nChefkoch is off by default. Its terms of use (section 5.1) restrict automated access. If you turn Chefkoch on, you use it at your own risk and responsibility.",
+        "data": {
+          "sources": "Active sources",
+          "accept_chefkoch_terms": "I have read the Chefkoch terms (section 5.1) and use Chefkoch at my own responsibility"
+        },
+        "data_description": {
+          "accept_chefkoch_terms": "Required only if Chefkoch is selected."
+        }
+      }
+    },
+    "error": {
+      "chefkoch_terms": "To use Chefkoch, confirm that you have read its terms and use it at your own responsibility."
+    }
+  },
+  "services": {
+    "import_recipe": {
+      "name": "Import recipe",
+      "description": "Loads a recipe from a web address and saves it in KitchenOwl. An existing recipe with the same address is reused.",
+      "fields": {
+        "url": {
+          "name": "Address",
+          "description": "Web address of the recipe page."
+        }
+      }
+    },
+    "add_recipe_to_shopping_list": {
+      "name": "Add recipe to shopping list",
+      "description": "Puts the ingredients of a KitchenOwl recipe on the configured shopping list.",
+      "fields": {
+        "recipe_id": {
+          "name": "Recipe ID",
+          "description": "ID of the recipe in KitchenOwl."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "EatFresh is not set up or not loaded."
+    },
+    "kitchenowl_auth": {
+      "message": "KitchenOwl rejected the access token: {message}"
+    },
+    "kitchenowl_error": {
+      "message": "KitchenOwl reported an error: {message}"
+    },
+    "source_blocked": {
+      "message": "The recipe website refused the request: {message}"
+    },
+    "source_error": {
+      "message": "The recipe could not be loaded: {message}"
+    },
+    "kitchenowl_auth_setup": {
+      "message": "KitchenOwl rejected the access token."
+    },
+    "kitchenowl_unavailable": {
+      "message": "KitchenOwl cannot be reached right now."
+    },
+    "shopping_list_partial": {
+      "message": "Only {added_recipes} of {total} recipes reached the shopping list: {message}"
+    }
+  }
+}

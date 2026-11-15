@@ -1,0 +1,72 @@
+{
+  "count": 3,
+  "queryId": "",
+  "results": [
+    {
+      "score": 100,
+      "recipe": {
+        "id": "100000000000001",
+        "title": "Beispiel-Kartoffelsuppe",
+        "subtitle": "",
+        "difficulty": 1,
+        "hasImage": true,
+        "isPlus": false,
+        "isPremium": false,
+        "preparationTime": 20,
+        "previewImageId": "90001",
+        "previewImageUrlTemplate": "https://img.chefkoch-cdn.de/rezepte/100000000000001/bilder/90001/<format>/beispiel-100000000000001.jpg",
+        "rating": {
+          "numVotes": 12,
+          "rating": 4.67
+        },
+        "siteUrl": "https://www.chefkoch.de/rezepte/100000000000001/Beispiel-100000000000001.html",
+        "slug": "Beispiel-100000000000001",
+        "type": 0
+      }
+    },
+    {
+      "score": 100,
+      "recipe": {
+        "id": "100000000000002",
+        "title": "Beispiel-Kartoffelgratin",
+        "subtitle": "",
+        "difficulty": 1,
+        "hasImage": true,
+        "isPlus": false,
+        "isPremium": false,
+        "preparationTime": 30,
+        "previewImageId": "90002",
+        "previewImageUrlTemplate": "https://img.chefkoch-cdn.de/rezepte/100000000000002/bilder/90002/<format>/beispiel-100000000000002.jpg",
+        "rating": {
+          "numVotes": 0,
+          "rating": 0.0
+        },
+        "siteUrl": "https://www.chefkoch.de/rezepte/100000000000002/Beispiel-100000000000002.html",
+        "slug": "Beispiel-100000000000002",
+        "type": 0
+      }
+    },
+    {
+      "score": 100,
+      "recipe": {
+        "id": "100000000000003",
+        "title": "Plus-Beispiel",
+        "subtitle": "",
+        "difficulty": 1,
+        "hasImage": true,
+        "isPlus": true,
+        "isPremium": false,
+        "preparationTime": 15,
+        "previewImageId": "90003",
+        "previewImageUrlTemplate": "https://img.chefkoch-cdn.de/rezepte/100000000000003/bilder/90003/<format>/beispiel-100000000000003.jpg",
+        "rating": {
+          "numVotes": 5,
+          "rating": 4.0
+        },
+        "siteUrl": "https://www.chefkoch.de/rezepte/100000000000003/Beispiel-100000000000003.html",
+        "slug": "Beispiel-100000000000003",
+        "type": 0
+      }
+    }
+  ]
+}

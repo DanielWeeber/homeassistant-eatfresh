@@ -1,0 +1,228 @@
+{
+  "id": 1001,
+  "slug": "wprm-1001",
+  "type": "wprm_recipe",
+  "link": "https://www.gaumenfreundin.de/beispiel-kuerbissuppe/",
+  "title": {
+    "rendered": "Beispiel-Kürbissuppe: schnell &amp; cremig"
+  },
+  "wprm_parent_post_id": "9001001",
+  "recipe": {
+    "id": 1001,
+    "language": "",
+    "type": "food",
+    "image_url": "https://www.gaumenfreundin.de/wp-content/uploads/2026/01/beispiel-kuerbissuppe.jpg",
+    "name": "Beispiel-Kürbissuppe: schnell &amp; cremig",
+    "summary": "<p>Eine erfundene Beispielsuppe f&uuml;r den Test.</p>",
+    "servings": "4",
+    "servings_unit": "Portionen",
+    "prep_time": "10",
+    "cook_time": "20",
+    "total_time": "30",
+    "tags": {
+      "course": [
+        {
+          "term_id": 1,
+          "name": "Suppe",
+          "slug": "suppe"
+        }
+      ],
+      "cuisine": [],
+      "keyword": [
+        {
+          "term_id": 2,
+          "name": "Einfach",
+          "slug": "einfach"
+        },
+        {
+          "term_id": 2,
+          "name": "Herbst",
+          "slug": "herbst"
+        }
+      ]
+    },
+    "ingredients": [
+      {
+        "name": "",
+        "uid": -1,
+        "ingredients": [
+          {
+            "uid": 0,
+            "amount": "1",
+            "unit": "",
+            "name": "Hokkaido-Kürbis",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 100,
+            "type": "ingredient"
+          },
+          {
+            "uid": 1,
+            "amount": "1/2",
+            "unit": "",
+            "name": "Zwiebel",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 101,
+            "type": "ingredient"
+          },
+          {
+            "uid": 2,
+            "amount": "2",
+            "unit": "EL",
+            "name": "Olivenöl",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 102,
+            "type": "ingredient"
+          },
+          {
+            "uid": 3,
+            "amount": "800",
+            "unit": "ml",
+            "name": "Gemüsebrühe",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 103,
+            "type": "ingredient"
+          },
+          {
+            "uid": 4,
+            "amount": "200",
+            "unit": "ml",
+            "name": "Sahne",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 104,
+            "type": "ingredient"
+          },
+          {
+            "uid": 5,
+            "amount": "1",
+            "unit": "Prise",
+            "name": "Muskat",
+            "notes": "frisch gerieben",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 105,
+            "type": "ingredient"
+          },
+          {
+            "uid": 6,
+            "amount": "1,5",
+            "unit": "TL",
+            "name": "Currypulver",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 106,
+            "type": "ingredient"
+          },
+          {
+            "uid": 7,
+            "amount": "2",
+            "unit": "Zehen",
+            "name": "Knoblauch",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 107,
+            "type": "ingredient"
+          },
+          {
+            "uid": 8,
+            "amount": "",
+            "unit": "",
+            "name": "Salz und Pfeffer",
+            "notes": "",
+            "link": {
+              "url": "",
+              "nofollow": "default",
+              "eafl": ""
+            },
+            "id": 108,
+            "type": "ingredient"
+          }
+        ]
+      }
+    ],
+    "instructions": [
+      {
+        "name": "",
+        "uid": -1,
+        "instructions": [
+          {
+            "uid": 0,
+            "name": "",
+            "text": "<p>Kürbis würfeln und die Zwiebel hacken.</p>",
+            "image": 0,
+            "ingredients": [],
+            "equipment": [],
+            "image_link": "",
+            "image_tooltip": "",
+            "type": "instruction",
+            "image_url": ""
+          },
+          {
+            "uid": 1,
+            "name": "",
+            "text": "<p>Alles in Öl anbraten und mit Brühe ablöschen.</p>",
+            "image": 0,
+            "ingredients": [],
+            "equipment": [],
+            "image_link": "",
+            "image_tooltip": "",
+            "type": "instruction",
+            "image_url": ""
+          },
+          {
+            "uid": 2,
+            "name": "",
+            "text": "<p>20 Minuten kochen, pürieren und mit Gewürzen abschmecken.</p>",
+            "image": 0,
+            "ingredients": [],
+            "equipment": [],
+            "image_link": "",
+            "image_tooltip": "",
+            "type": "instruction",
+            "image_url": ""
+          }
+        ]
+      }
+    ],
+    "rating": {
+      "count": "2",
+      "average": "4.5",
+      "user_ratings": false
+    }
+  }
+}

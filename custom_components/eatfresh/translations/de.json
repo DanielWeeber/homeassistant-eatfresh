@@ -1,0 +1,119 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "KitchenOwl verbinden",
+        "description": "EatFresh speichert Rezepte in KitchenOwl und setzt Zutaten auf deine Einkaufsliste. Gib die Adresse deines KitchenOwl-Servers und einen langlebigen Zugangsschlüssel ein (KitchenOwl: Einstellungen > Sitzungen > Langlebige Tokens).",
+        "data": {
+          "url": "Adresse von KitchenOwl",
+          "token": "Zugangsschlüssel"
+        },
+        "data_description": {
+          "url": "Adresse deines KitchenOwl-Servers, zum Beispiel {example_url}",
+          "token": "Der Schlüssel wird in Home Assistant gespeichert und nie wieder angezeigt."
+        }
+      },
+      "household": {
+        "title": "Haushalt wählen",
+        "description": "In diesem KitchenOwl-Haushalt werden die Rezepte gespeichert.",
+        "data": {
+          "household_id": "Haushalt"
+        }
+      },
+      "shoppinglist": {
+        "title": "Einkaufsliste wählen",
+        "description": "Auf diese Einkaufsliste kommen die Zutaten.",
+        "data": {
+          "shoppinglist_id": "Einkaufsliste"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Zugang zu KitchenOwl erneuern",
+        "description": "KitchenOwl hat den Zugangsschlüssel abgelehnt. Gib einen neuen langlebigen Zugangsschlüssel ein.",
+        "data": {
+          "token": "Zugangsschlüssel"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Gib eine vollständige Adresse ein, die mit http:// oder https:// beginnt.",
+      "invalid_auth": "KitchenOwl hat den Zugangsschlüssel abgelehnt.",
+      "cannot_connect": "KitchenOwl ist unter dieser Adresse nicht erreichbar.",
+      "no_households": "Dieses Konto hat in KitchenOwl keinen Haushalt.",
+      "no_shoppinglists": "Dieser Haushalt hat in KitchenOwl keine Einkaufsliste.",
+      "unknown": "Unerwarteter Fehler. Details stehen im Protokoll."
+    },
+    "abort": {
+      "already_configured": "EatFresh ist für diesen Haushalt schon eingerichtet.",
+      "single_instance_allowed": "EatFresh ist schon eingerichtet. Es geht nur eine Einrichtung.",
+      "invalid_auth": "KitchenOwl hat den Zugangsschlüssel abgelehnt.",
+      "reauth_successful": "Der Zugangsschlüssel wurde erneuert."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Rezeptquellen",
+        "description": "Wähle die Webseiten, in denen EatFresh sucht. „Rezept-Link einfügen“ geht immer. EatFresh ruft eine Seite nur ab, wenn du suchst oder ein Rezept öffnest.\n\nChefkoch ist standardmäßig aus. Die AGB von Chefkoch (Ziffer 5.1) schränken automatische Abrufe ein. Wenn du Chefkoch einschaltest, liegt die Nutzung in deiner eigenen Verantwortung.",
+        "data": {
+          "sources": "Aktive Quellen",
+          "accept_chefkoch_terms": "Ich kenne die AGB von Chefkoch (Ziffer 5.1) und nutze Chefkoch in eigener Verantwortung"
+        },
+        "data_description": {
+          "accept_chefkoch_terms": "Nur nötig, wenn Chefkoch ausgewählt ist."
+        }
+      }
+    },
+    "error": {
+      "chefkoch_terms": "Für Chefkoch bitte bestätigen, dass du die AGB kennst und Chefkoch in eigener Verantwortung nutzt."
+    }
+  },
+  "services": {
+    "import_recipe": {
+      "name": "Rezept importieren",
+      "description": "Lädt ein Rezept von einer Webadresse und speichert es in KitchenOwl. Gibt es dort schon ein Rezept mit derselben Adresse, wird es genommen.",
+      "fields": {
+        "url": {
+          "name": "Adresse",
+          "description": "Webadresse der Rezeptseite."
+        }
+      }
+    },
+    "add_recipe_to_shopping_list": {
+      "name": "Rezept auf die Einkaufsliste",
+      "description": "Setzt die Zutaten eines KitchenOwl-Rezepts auf die eingerichtete Einkaufsliste.",
+      "fields": {
+        "recipe_id": {
+          "name": "Rezept-ID",
+          "description": "ID des Rezepts in KitchenOwl."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "EatFresh ist nicht eingerichtet oder nicht geladen."
+    },
+    "kitchenowl_auth": {
+      "message": "KitchenOwl hat den Zugangsschlüssel abgelehnt: {message}"
+    },
+    "kitchenowl_error": {
+      "message": "KitchenOwl meldet einen Fehler: {message}"
+    },
+    "source_blocked": {
+      "message": "Die Rezeptseite hat die Anfrage abgelehnt: {message}"
+    },
+    "source_error": {
+      "message": "Das Rezept ließ sich nicht laden: {message}"
+    },
+    "kitchenowl_auth_setup": {
+      "message": "KitchenOwl hat den Zugangsschlüssel abgelehnt."
+    },
+    "kitchenowl_unavailable": {
+      "message": "KitchenOwl ist gerade nicht erreichbar."
+    },
+    "shopping_list_partial": {
+      "message": "Nur {added_recipes} von {total} Rezepten sind auf der Einkaufsliste: {message}"
+    }
+  }
+}
