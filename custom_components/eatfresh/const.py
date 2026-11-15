@@ -9,7 +9,7 @@ DOMAIN: Final = "eatfresh"
 NAME: Final = "EatFresh"
 VERSION: Final = "0.1.0"
 
-REPOSITORY_URL: Final = "https://github.com/OWNER/homeassistant-eatfresh"
+REPOSITORY_URL: Final = "https://github.com/DanielWeeber/homeassistant-eatfresh"
 USER_AGENT: Final = f"EatFresh/{VERSION} (+{REPOSITORY_URL})"
 
 # Config entry data

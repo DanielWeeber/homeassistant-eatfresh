@@ -1,13 +1,13 @@
 {
   "domain": "eatfresh",
   "name": "EatFresh",
-  "codeowners": ["@OWNER"],
+  "codeowners": ["@DanielWeeber"],
   "config_flow": true,
   "dependencies": ["frontend", "http", "panel_custom", "websocket_api"],
-  "documentation": "https://github.com/OWNER/homeassistant-eatfresh",
+  "documentation": "https://github.com/DanielWeeber/homeassistant-eatfresh",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/OWNER/homeassistant-eatfresh/issues",
+  "issue_tracker": "https://github.com/DanielWeeber/homeassistant-eatfresh/issues",
   "requirements": [],
   "single_config_entry": true,
   "version": "0.1.0"

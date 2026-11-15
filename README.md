@@ -9,7 +9,7 @@ EatFresh ist eine Integration für Home Assistant. Sie sucht Rezepte auf ausgew�
 ### Installation über HACS
 
 1. HACS öffnen, oben rechts das Menü wählen, dann **Benutzerdefinierte Repositories**.
-2. Adresse `https://github.com/OWNER/homeassistant-eatfresh` eintragen, Typ **Integration**.
+2. Adresse `https://github.com/DanielWeeber/homeassistant-eatfresh` eintragen, Typ **Integration**.
 3. EatFresh herunterladen und Home Assistant neu starten.
 
 Mindestversion: Home Assistant 2026.11. Getestet mit KitchenOwl 0.8.1. KitchenOwl lädt das Foto eines Rezepts selbst von der Rezeptseite herunter.
@@ -48,7 +48,7 @@ EatFresh is a Home Assistant integration. It searches selected recipe websites, 
 ### Installation with HACS
 
 1. Open HACS, choose the menu in the top right corner, then **Custom repositories**.
-2. Add `https://github.com/OWNER/homeassistant-eatfresh` with type **Integration**.
+2. Add `https://github.com/DanielWeeber/homeassistant-eatfresh` with type **Integration**.
 3. Download EatFresh and restart Home Assistant.
 
 Minimum version: Home Assistant 2026.11. Tested with KitchenOwl 0.8.1. KitchenOwl downloads the photo of a recipe itself from the recipe page.
