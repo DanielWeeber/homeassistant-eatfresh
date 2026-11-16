@@ -20,13 +20,20 @@ from .const import (
     ERR_KITCHENOWL_ERROR,
     ERR_NOT_FOUND,
     ERR_NOT_LOADED,
+    ERR_PICNIC_ERROR,
+    ERR_PICNIC_UNAVAILABLE,
     ERR_SOURCE_BLOCKED,
     ERR_SOURCE_ERROR,
+    MAX_PICNIC_AMOUNT,
+    MAX_PICNIC_NAME_LENGTH,
+    MAX_PICNIC_QUERY_LENGTH,
+    MAX_PICNIC_SEND_ITEMS,
     MAX_PLANNER_YEAR,
     MAX_SEARCH_LIMIT,
     MAX_TAG_LENGTH,
     MAX_TAGS,
     MIN_PLANNER_YEAR,
+    PICNIC_SEARCH_LIMIT,
 )
 from .errors import (
     EatFreshError,
@@ -37,6 +44,7 @@ from .errors import (
     SourceError,
 )
 from .image_proxy import sign_image_url, sign_photo
+from . import picnic
 from .runtime import (
     EatFreshData,
     PlannerWeek,
@@ -94,6 +102,12 @@ def error_code(err: EatFreshError) -> str:
         return ERR_KITCHENOWL_AUTH
     if isinstance(err, KitchenOwlError):
         return ERR_KITCHENOWL_ERROR
+    if isinstance(err, picnic.PicnicNothingToUndo):
+        return ERR_NOT_FOUND
+    if isinstance(err, picnic.PicnicUnavailable):
+        return ERR_PICNIC_UNAVAILABLE
+    if isinstance(err, picnic.PicnicError):
+        return ERR_PICNIC_ERROR
     return ERR_SOURCE_ERROR
 
 
@@ -133,6 +147,15 @@ def _with_data(
                     "message": error_message(err.cause),
                 },
             )
+        except picnic.PicnicError as err:
+            # The panel translates the code of a Picnic error (translation_key).
+            connection.send_error(
+                msg["id"],
+                error_code(err),
+                error_message(err),
+                translation_key=f"picnic_{err.code}",
+                translation_domain=DOMAIN,
+            )
         except EatFreshError as err:
             async_reauth_on_auth_error(hass, err)
             connection.send_error(msg["id"], error_code(err), error_message(err))
@@ -161,6 +184,13 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_planner_add,
         ws_planner_remove,
         ws_planner_shopping_list,
+        ws_shopping,
+        ws_picnic_search,
+        ws_picnic_map,
+        ws_picnic_unmap,
+        ws_picnic_skip,
+        ws_picnic_send,
+        ws_picnic_undo,
     ):
         websocket_api.async_register_command(hass, command)
 
@@ -604,3 +634,195 @@ async def ws_planner_shopping_list(
         msg.get("week_start"), confirm=msg["confirm"]
     )
     connection.send_result(msg["id"], result)
+
+
+# ----- shopping list and Picnic ---------------------------------------------
+
+PICNIC_NAME = vol.All(str, vol.Strip, vol.Length(min=1, max=MAX_PICNIC_NAME_LENGTH))
+
+
+def _picnic_product_id(value: Any) -> str:
+    """Validate a Picnic product id: text (or a whole number) of 1 to 64 signs."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str):
+        raise vol.Invalid("Expected a product id")
+    value = value.strip()
+    if not 1 <= len(value) <= picnic.MAX_ID_LENGTH or not value.isprintable():
+        raise vol.Invalid("Expected a product id of 1 to 64 signs")
+    return value
+
+
+def _price_cents(value: Any) -> int:
+    """Validate a price in cents."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise vol.Invalid("Expected a price in cents")
+    return value
+
+
+PICNIC_PRODUCT_ID = _picnic_product_id
+PICNIC_AMOUNT = vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_PICNIC_AMOUNT))
+PICNIC_PRODUCT = vol.Schema(
+    {
+        vol.Required("id"): PICNIC_PRODUCT_ID,
+        vol.Required("name"): vol.All(
+            str, vol.Strip, vol.Length(min=1, max=picnic.MAX_NAME_LENGTH)
+        ),
+        vol.Optional("unit_quantity", default=None): vol.Any(
+            None, vol.All(str, vol.Strip, vol.Length(max=picnic.MAX_UNIT_LENGTH))
+        ),
+        vol.Optional("price", default=None): vol.Any(None, _price_cents),
+    },
+    extra=vol.REMOVE_EXTRA,
+)
+
+
+@websocket_api.websocket_command({vol.Required("type"): "eatfresh/shopping"})
+@websocket_api.async_response
+@_with_data
+async def ws_shopping(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Return the shopping list with Picnic products. Never calls Picnic."""
+    connection.send_result(msg["id"], await data.async_shopping(hass))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/search",
+        vol.Required("query"): vol.All(
+            str, vol.Strip, vol.Length(min=1, max=MAX_PICNIC_QUERY_LENGTH)
+        ),
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_search(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Search Picnic products (only when the user asks)."""
+    products = await picnic.async_search(hass, msg["query"], PICNIC_SEARCH_LIMIT)
+    connection.send_result(msg["id"], {"products": products})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/map",
+        vol.Required("name"): PICNIC_NAME,
+        vol.Required("product"): PICNIC_PRODUCT,
+        vol.Optional("amount"): PICNIC_AMOUNT,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_map(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Remember the Picnic product of an ingredient."""
+    product = msg["product"]
+    data.store.async_set_picnic_product(
+        msg["name"],
+        product_id=product["id"],
+        product_name=product["name"],
+        unit_quantity=product["unit_quantity"] or None,
+        price=product["price"],
+        amount=msg.get("amount"),
+    )
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "eatfresh/picnic/unmap", vol.Required("name"): PICNIC_NAME}
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_unmap(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Forget the Picnic product of an ingredient."""
+    data.store.async_remove_picnic_product(msg["name"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/skip",
+        vol.Required("name"): PICNIC_NAME,
+        vol.Required("skip"): bool,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_skip(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Never buy an ingredient at Picnic, or take it back in."""
+    data.store.async_set_picnic_skip(msg["name"], msg["skip"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/send",
+        vol.Required("items"): vol.All(
+            [
+                vol.Schema(
+                    {
+                        vol.Required("item_id"): KITCHENOWL_ID,
+                        vol.Required("product_id"): PICNIC_PRODUCT_ID,
+                        vol.Required("amount"): PICNIC_AMOUNT,
+                    }
+                )
+            ],
+            vol.Length(min=1, max=MAX_PICNIC_SEND_ITEMS),
+        ),
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_send(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Put products into the Picnic cart. Nothing is ever ordered."""
+    connection.send_result(
+        msg["id"], await data.async_picnic_send(hass, msg["items"])
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/undo",
+        vol.Required("item_id"): KITCHENOWL_ID,
+        # False: only forget the mark (the product was not in the cart).
+        vol.Optional("remove", default=True): bool,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_undo(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Take what EatFresh put into the cart for an entry out again."""
+    await data.async_picnic_undo(hass, msg["item_id"], msg["remove"])
+    connection.send_result(msg["id"], {})

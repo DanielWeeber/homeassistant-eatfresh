@@ -136,6 +136,101 @@ async def test_list_shoppinglists(client, mock):
     assert await client.list_shoppinglists(1) == [{"id": 5, "name": "Weekly"}]
 
 
+async def test_list_shoppinglist_items(client, mock):
+    mock.get(
+        f"{BASE}/api/shoppinglist/5/items",
+        payload=[
+            {
+                "id": 11,
+                "name": "Mehl",
+                "description": "500g",
+                "icon": None,
+                "category": {"id": 2, "name": "Backen"},
+                "created_at": 1700000000000,
+            },
+            {"id": 12, "name": "Eier", "description": None},
+            {"id": 13, "name": "Pfeffer"},
+        ],
+    )
+    assert await client.list_shoppinglist_items(5) == [
+        {"id": 11, "name": "Mehl", "description": "500g"},
+        {"id": 12, "name": "Eier", "description": ""},
+        {"id": 13, "name": "Pfeffer", "description": ""},
+    ]
+    # Read only: exactly one GET, no body, no other method.
+    assert len(mock.requests) == 1
+    url, kwargs = last_request(mock, "GET")
+    assert str(url).endswith("/api/shoppinglist/5/items")
+    assert kwargs["headers"]["Authorization"] == f"Bearer {TOKEN}"
+    assert not kwargs.get("params")
+
+
+async def test_list_shoppinglist_items_empty(client, mock):
+    mock.get(f"{BASE}/api/shoppinglist/5/items", payload=[])
+    assert await client.list_shoppinglist_items(5) == []
+
+
+async def test_list_shoppinglist_items_skips_broken_rows(client, mock):
+    mock.get(
+        f"{BASE}/api/shoppinglist/5/items",
+        payload=[
+            {"id": 1, "name": "Milch", "description": "1L"},
+            {"id": 2, "name": ""},
+            {"id": 3, "name": "   "},
+            {"name": "ohne Nummer"},
+            {"id": "x", "name": "Nummer kaputt"},
+            {"id": "7", "name": "Nummer als Text", "description": 5},
+            "kaputt",
+            None,
+        ],
+    )
+    assert await client.list_shoppinglist_items(5) == [
+        {"id": 1, "name": "Milch", "description": "1L"},
+        {"id": 7, "name": "Nummer als Text", "description": ""},
+    ]
+
+
+async def test_list_shoppinglist_items_keeps_server_order(client, mock):
+    mock.get(
+        f"{BASE}/api/shoppinglist/5/items",
+        payload=[{"id": 3, "name": "Zucker"}, {"id": 1, "name": "Apfel"}, {"id": 2, "name": "Brot"}],
+    )
+    assert [i["id"] for i in await client.list_shoppinglist_items(5)] == [3, 1, 2]
+
+
+async def test_list_shoppinglist_items_not_a_list(client, mock):
+    mock.get(f"{BASE}/api/shoppinglist/5/items", payload={"items": []})
+    with pytest.raises(KitchenOwlError):
+        await client.list_shoppinglist_items(5)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_list_shoppinglist_items_auth_error(client, mock, status):
+    mock.get(f"{BASE}/api/shoppinglist/5/items", status=status, payload={"msg": "nope"})
+    with pytest.raises(KitchenOwlAuthError):
+        await client.list_shoppinglist_items(5)
+
+
+@pytest.mark.parametrize("status", [404, 500])
+async def test_list_shoppinglist_items_server_error(client, mock, status):
+    mock.get(f"{BASE}/api/shoppinglist/5/items", status=status, body="boom")
+    with pytest.raises(KitchenOwlError) as err:
+        await client.list_shoppinglist_items(5)
+    assert not isinstance(err.value, KitchenOwlAuthError)
+
+
+async def test_list_shoppinglist_items_network_errors(client, mock):
+    mock.get(f"{BASE}/api/shoppinglist/5/items", exception=aiohttp.ClientConnectionError("down"))
+    with pytest.raises(KitchenOwlError):
+        await client.list_shoppinglist_items(5)
+    mock.get(f"{BASE}/api/shoppinglist/5/items", exception=TimeoutError())
+    with pytest.raises(KitchenOwlError):
+        await client.list_shoppinglist_items(5)
+    mock.get(f"{BASE}/api/shoppinglist/5/items", body="<html>", content_type="text/html")
+    with pytest.raises(KitchenOwlError):
+        await client.list_shoppinglist_items(5)
+
+
 async def test_list_recipes(client, mock):
     mock.get(
         f"{BASE}/api/household/1/recipe",

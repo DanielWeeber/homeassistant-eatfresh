@@ -102,6 +102,10 @@
         "limit": {
           "name": "Höchstzahl",
           "description": "Höchstens so viele Rezepte in der Antwort (1 bis 200, Standard 50). Die Antwort nennt in „total“ die Zahl aller Treffer."
+        },
+        "name_only": {
+          "name": "Nur Name",
+          "description": "Den Suchtext nur mit dem Rezeptnamen vergleichen, nicht mit den Zutaten. Standard: aus."
         }
       }
     },
@@ -175,6 +179,57 @@
     },
     "not_in_collection": {
       "message": "Das Rezept gehört nicht zur Sammlung dieses Haushalts."
+    },
+    "picnic_not_set_up": {
+      "message": "Die Picnic-Integration ist in Home Assistant nicht eingerichtet."
+    },
+    "picnic_not_loaded": {
+      "message": "Die Picnic-Integration ist eingerichtet, läuft aber nicht. Prüfe sie in Home Assistant."
+    },
+    "picnic_unknown_form": {
+      "message": "Die Picnic-Integration hat sich geändert. Mit dieser Version kann EatFresh nichts in den Picnic-Warenkorb legen."
+    },
+    "picnic_no_search": {
+      "message": "Diese Version der Picnic-Integration bietet keine Produktsuche."
+    },
+    "picnic_no_remove": {
+      "message": "Herausnehmen geht hier nicht. Nimm es in der Picnic-App aus dem Warenkorb."
+    },
+    "picnic_auth": {
+      "message": "Picnic hat die Anmeldung abgelehnt. Melde dich in Home Assistant bei der Picnic-Integration neu an."
+    },
+    "picnic_timeout": {
+      "message": "Picnic hat nicht rechtzeitig geantwortet."
+    },
+    "picnic_error": {
+      "message": "Picnic hat einen Fehler gemeldet."
+    },
+    "picnic_nothing_to_undo": {
+      "message": "Für diesen Eintrag gibt es nichts rückgängig zu machen."
+    },
+    "picnic_busy": {
+      "message": "Gerade werden schon Produkte in den Picnic-Warenkorb gelegt. Warte einen Moment."
+    },
+    "picnic_not_added": {
+      "message": "Picnic hat das Produkt nicht in den Warenkorb gelegt, zum Beispiel weil es gerade nicht lieferbar ist. EatFresh hat aufgehört."
+    },
+    "picnic_search_running": {
+      "message": "Es läuft schon eine Suche bei Picnic. Warte, bis sie fertig ist."
+    },
+    "picnic_call_running": {
+      "message": "Picnic ist noch mit dem Aufruf davor beschäftigt. Versuch es später noch einmal. Hilft das nicht, Home Assistant neu starten."
+    },
+    "picnic_maybe_no_undo": {
+      "message": "Bei „Vielleicht im Warenkorb“ nimmt EatFresh nichts heraus. Sieh in der Picnic-App nach und nimm es dort heraus."
+    },
+    "picnic_cart_unreadable": {
+      "message": "EatFresh konnte den Picnic-Warenkorb nicht lesen und hat nichts geändert. Versuch es später noch einmal."
+    },
+    "picnic_cart_changed": {
+      "message": "Im Picnic-Warenkorb liegen weniger Stücke davon, als EatFresh hineingelegt hat. EatFresh hat nichts herausgenommen. Sieh in der Picnic-App nach."
+    },
+    "picnic_maybe_sent": {
+      "message": "Picnic hat nicht eindeutig geantwortet. Sieh in der Picnic-App nach."
     }
   },
   "entity": {

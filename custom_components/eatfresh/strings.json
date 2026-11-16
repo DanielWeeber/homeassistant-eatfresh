@@ -102,6 +102,10 @@
         "limit": {
           "name": "Limit",
           "description": "Most recipes in the response (1 to 200, default 50). The response names the number of all matches in total."
+        },
+        "name_only": {
+          "name": "Name only",
+          "description": "Compare the search text only with the recipe name, not with the ingredients. Default: off."
         }
       }
     },
@@ -175,6 +179,57 @@
     },
     "not_in_collection": {
       "message": "The recipe is not in the collection of this household."
+    },
+    "picnic_not_set_up": {
+      "message": "The Picnic integration is not set up in Home Assistant."
+    },
+    "picnic_not_loaded": {
+      "message": "The Picnic integration is set up but not running. Check it in Home Assistant."
+    },
+    "picnic_unknown_form": {
+      "message": "The Picnic integration has changed. With this version EatFresh cannot put anything into the Picnic cart."
+    },
+    "picnic_no_search": {
+      "message": "This version of the Picnic integration offers no product search."
+    },
+    "picnic_no_remove": {
+      "message": "Taking it out of the cart does not work here. Remove it in the Picnic app."
+    },
+    "picnic_auth": {
+      "message": "Picnic rejected the login. Sign in again in the Picnic integration of Home Assistant."
+    },
+    "picnic_timeout": {
+      "message": "Picnic did not answer in time."
+    },
+    "picnic_error": {
+      "message": "Picnic reported an error."
+    },
+    "picnic_nothing_to_undo": {
+      "message": "There is nothing to undo for this entry."
+    },
+    "picnic_busy": {
+      "message": "Products are being added to the Picnic cart already. Wait a moment."
+    },
+    "picnic_not_added": {
+      "message": "Picnic did not put the product into the cart, for example because it is not available right now. EatFresh stopped."
+    },
+    "picnic_search_running": {
+      "message": "A search at Picnic is running already. Wait until it is done."
+    },
+    "picnic_call_running": {
+      "message": "Picnic is still busy with the call before. Try again later. If that does not help, restart Home Assistant."
+    },
+    "picnic_maybe_no_undo": {
+      "message": "For “maybe in the cart” EatFresh takes nothing out. Check the Picnic app and take it out there."
+    },
+    "picnic_cart_unreadable": {
+      "message": "EatFresh could not read the Picnic cart and changed nothing. Try again later."
+    },
+    "picnic_cart_changed": {
+      "message": "The Picnic cart has fewer pieces of it than EatFresh put in. EatFresh took nothing out. Check the Picnic app."
+    },
+    "picnic_maybe_sent": {
+      "message": "Picnic's answer was not clear. Check the Picnic app."
     }
   },
   "entity": {

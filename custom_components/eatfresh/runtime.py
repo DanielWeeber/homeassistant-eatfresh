@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 from yarl import URL
 
-from . import kitchenowl as kitchenowl_module
+from . import kitchenowl as kitchenowl_module, picnic
 from .categories import canonical_category, category_names, suggest_categories
 from .const import (
     CHEFKOCH,
@@ -37,6 +37,7 @@ from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, RecipeN
 from .http import UnsafeAddress, check_public_url, host_matches, split_url
 from .kitchenowl import normalize_source
 from .models import Recipe, SearchHit, split_key
+from .picnic_amount import suggest_amount
 from .store import Favorite, FavoritesStore, TTLCache
 
 if TYPE_CHECKING:
@@ -261,6 +262,8 @@ class EatFreshData:
     # The fetch of the meal plan that callers of
     # ``async_current_planner_entries`` share while it runs.
     _planner_fetch: asyncio.Task[list[dict[str, Any]]] | None = None
+    # One transfer to (or undo in) the Picnic cart at a time.
+    _picnic_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ----- images -------------------------------------------------------
 
@@ -599,12 +602,16 @@ class EatFreshData:
         return recipes
 
     async def async_search_collection(
-        self, query: str | None, limit: int = DEFAULT_COLLECTION_LIMIT
+        self,
+        query: str | None,
+        limit: int = DEFAULT_COLLECTION_LIMIT,
+        name_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         """Return the visible recipes of the collection whose name or an
         ingredient contains ``query`` (any case), each with its planned days,
         and the number of all matches.
 
+        With ``name_only`` only the name is compared, not the ingredients.
         Without ``query`` the whole visible collection matches. At most
         ``limit`` recipes come back. The days come from the plan of the last
         ``PLANNER_MAX_AGE`` if there is one. If only the plan cannot be
@@ -617,8 +624,12 @@ class EatFreshData:
                 recipe
                 for recipe in recipes
                 if needle in str(recipe.get("name") or "").casefold()
-                or any(
-                    needle in str(item).casefold() for item in recipe.get("items") or []
+                or (
+                    not name_only
+                    and any(
+                        needle in str(item).casefold()
+                        for item in recipe.get("items") or []
+                    )
                 )
             ]
         total = len(recipes)
@@ -850,6 +861,227 @@ class EatFreshData:
                     raise
                 raise ShoppingListPartial(err, done, len(recipe_ids), added) from err
         return added
+
+    # ----- Picnic -------------------------------------------------------
+
+    async def async_shopping(self, hass: HomeAssistant) -> dict[str, Any]:
+        """Return the shopping list with the remembered Picnic products.
+
+        Reads only KitchenOwl and the store, never Picnic. Marks of entries
+        that left the list or are older than 14 days are dropped.
+        """
+        rows = await self.client.list_shoppinglist_items(self.shoppinglist_id)
+        self.store.async_prune_picnic_sent(row["id"] for row in rows)
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            name = row["name"]
+            description = row.get("description") or ""
+            product: dict[str, Any] | None = None
+            amount = 1
+            if (stored := self.store.picnic_product(name)) is not None:
+                product = {
+                    "id": stored["product_id"],
+                    "name": stored["name"],
+                    "unit_quantity": stored["unit_quantity"],
+                    "price": stored["price"],
+                }
+                amount = stored["amount"] or suggest_amount(
+                    description, stored["unit_quantity"]
+                )
+            sent = self.store.picnic_sent(row["id"])
+            if sent is not None:
+                # Show what went into the cart (and what "undo" takes out).
+                amount = sent["amount"]
+            items.append(
+                {
+                    "item_id": row["id"],
+                    "name": name,
+                    "description": description,
+                    "product": product,
+                    "amount": amount,
+                    "skip": self.store.is_picnic_skipped(name),
+                    "sent_at": sent["at"] if sent else None,
+                    "sent_uncertain": bool(sent and sent.get("uncertain")),
+                }
+            )
+        return {"picnic": picnic.async_status(hass), "items": items}
+
+    async def async_picnic_send(
+        self, hass: HomeAssistant, wanted: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Put products into the Picnic cart, one entry after the other.
+
+        Only entries that are on the shopping list and not marked as sent
+        yet are sent. An entry only counts as sent when the cart in Picnic's
+        answer shows the product with the pieces expected.
+
+        Before the first product goes in, the cart is read once
+        (``get_cart``), so the pieces before are known for every product.
+        If that read fails or its answer is unreadable, the run does not
+        start (``PicnicError``, nothing marked, nothing sent). After it only
+        the answers of the single calls count.
+
+        The run stops at the first error of any kind: no further call to
+        Picnic. The entries after it are reported as ``not_tried``.
+
+        Before each call the entry is marked as "maybe sent" and saved at
+        once; the answer turns the mark into "sent", removes it (surely not
+        in the cart) or leaves it (maybe in the cart: never sent again by
+        itself; the user checks the Picnic app and clears the mark).
+
+        Each failed entry carries a ``code`` (translated by the panel) and an
+        English ``message`` as a fallback.
+        """
+        if self._picnic_lock.locked():
+            raise picnic.PicnicError(MSG_PICNIC_BUSY, CODE_PICNIC_BUSY)
+        async with self._picnic_lock:
+            picnic.require_available(hass)
+            rows = await self.client.list_shoppinglist_items(self.shoppinglist_id)
+            on_list = {row["id"] for row in rows}
+            self.store.async_prune_picnic_sent(on_list)
+            sent: list[dict[str, Any]] = []
+            failed: list[dict[str, Any]] = []
+            seen: set[int] = set()
+            stopped = False
+            # The cart as read at the start, then of Picnic's last answer.
+            cart: dict[str, int | None] | None = None
+
+            def fail(item_id: int, code: str, message: str) -> None:
+                failed.append({"item_id": item_id, "code": code, "message": message})
+
+            for item in wanted:
+                item_id = item["item_id"]
+                product_id = item["product_id"]
+                amount = item["amount"]
+                if stopped:
+                    fail(item_id, CODE_PICNIC_NOT_TRIED, MSG_PICNIC_NOT_TRIED)
+                    continue
+                if item_id in seen:
+                    fail(item_id, CODE_PICNIC_TWICE, MSG_PICNIC_TWICE)
+                    continue
+                seen.add(item_id)
+                if item_id not in on_list:
+                    fail(item_id, CODE_PICNIC_NOT_ON_LIST, MSG_PICNIC_NOT_ON_LIST)
+                    continue
+                if self.store.picnic_sent(item_id) is not None:
+                    fail(item_id, CODE_PICNIC_SENT, MSG_PICNIC_SENT)
+                    continue
+                if cart is None:
+                    # Once per run, only when something goes in: without the
+                    # cart before, the run does not start (the error goes
+                    # to the caller, nothing is marked).
+                    cart = await picnic.async_cart(hass)
+                # Marked as "maybe" on disk before the call: should Home
+                # Assistant stop during the call, it is never sent twice.
+                self.store.async_set_picnic_sent(
+                    item_id, product_id, amount, uncertain=True
+                )
+                await self.store.async_save_now()
+                try:
+                    cart = await picnic.async_add(hass, product_id, amount, cart)
+                except picnic.PicnicError as err:
+                    stopped = True
+                    if err.nothing_done:
+                        # Surely not in the cart: it can go again on purpose.
+                        self.store.async_remove_picnic_sent(item_id)
+                        fail(item_id, err.code, str(err))
+                    elif isinstance(err, picnic.PicnicTimeout):
+                        fail(item_id, CODE_PICNIC_MAYBE_SENT, MSG_PICNIC_MAYBE_SENT)
+                    else:
+                        fail(item_id, CODE_PICNIC_MAYBE_SENT, MSG_PICNIC_UNCLEAR)
+                except Exception:
+                    # Unexpected: it may have gone through. Keep "maybe", stop.
+                    _LOGGER.exception("Putting a product into the Picnic cart failed")
+                    stopped = True
+                    fail(item_id, CODE_PICNIC_MAYBE_SENT, MSG_PICNIC_UNCLEAR)
+                else:
+                    self.store.async_set_picnic_sent(item_id, product_id, amount)
+                    sent.append(
+                        {"item_id": item_id, "product_id": product_id, "amount": amount}
+                    )
+                await self.store.async_save_now()
+            # Let the Picnic integration read its cart once, but never after a
+            # stop: that would be one more call to a Picnic that just failed.
+            if sent and not stopped:
+                await picnic.async_refresh(hass)
+        return {"sent": sent, "failed": failed}
+
+    async def async_picnic_undo(
+        self, hass: HomeAssistant, item_id: int, remove: bool = True
+    ) -> None:
+        """Take what EatFresh put into the cart for an entry out again.
+
+        Only for an entry surely in the cart, and only the pieces EatFresh
+        put in. With ``remove`` False only the mark goes (no call to
+        Picnic): for an entry that is "maybe sent" and turned out not to be
+        in the cart. A "maybe sent" entry is never taken out.
+
+        Taking out reads the cart first and compares it with the answer.
+        If the answer is unclear or the pieces did not drop as expected, the
+        pieces may be out already: the entry becomes "maybe sent", so it is
+        never taken out a second time. The same if the cart has fewer
+        pieces than EatFresh put in (nothing is taken out then).
+        """
+        if self._picnic_lock.locked():
+            raise picnic.PicnicError(MSG_PICNIC_BUSY, CODE_PICNIC_BUSY)
+        async with self._picnic_lock:
+            mark = self.store.picnic_sent(item_id)
+            if mark is None:
+                raise picnic.PicnicNothingToUndo(MSG_PICNIC_NOTHING_TO_UNDO)
+            if not remove:
+                self.store.async_remove_picnic_sent(item_id)
+                await self.store.async_save_now()
+                return
+            if mark.get("uncertain"):
+                raise picnic.PicnicError(MSG_PICNIC_MAYBE_NO_UNDO, CODE_PICNIC_MAYBE_NO_UNDO)
+            try:
+                await picnic.async_remove(hass, mark["product_id"], mark["amount"])
+            except picnic.PicnicError as err:
+                if not err.nothing_done or isinstance(err, picnic.PicnicCartChanged):
+                    self._picnic_mark_unclear(item_id, mark)
+                    await self.store.async_save_now()
+                raise
+            except Exception:
+                self._picnic_mark_unclear(item_id, mark)
+                await self.store.async_save_now()
+                raise
+            self.store.async_remove_picnic_sent(item_id)
+            await self.store.async_save_now()
+            await picnic.async_refresh(hass)
+
+    def _picnic_mark_unclear(self, item_id: int, mark: Mapping[str, Any]) -> None:
+        """Turn a mark into "maybe sent" (it may be out of the cart already)."""
+        self.store.async_set_picnic_sent(
+            item_id, mark["product_id"], mark["amount"], uncertain=True
+        )
+
+
+MSG_PICNIC_BUSY = "A transfer to Picnic is running already"
+MSG_PICNIC_TWICE = "The entry is in the request twice"
+MSG_PICNIC_NOT_ON_LIST = "The entry is no longer on the shopping list"
+MSG_PICNIC_SENT = "The entry is in the Picnic cart already"
+MSG_PICNIC_MAYBE_SENT = (
+    "Picnic did not answer in time; the product may be in the cart anyway. "
+    "Please check the Picnic app"
+)
+MSG_PICNIC_UNCLEAR = (
+    "Picnic's answer does not show whether the product is in the cart; "
+    "it may be in the cart. Please check the Picnic app"
+)
+MSG_PICNIC_NOT_TRIED = "Not sent: the transfer stopped at an error before"
+MSG_PICNIC_NOTHING_TO_UNDO = "Nothing to undo for this entry"
+MSG_PICNIC_MAYBE_NO_UNDO = (
+    "EatFresh takes nothing out for an entry that is maybe in the cart; "
+    "please check the Picnic app"
+)
+# Codes of these messages (the panel translates them).
+CODE_PICNIC_BUSY = "busy"
+CODE_PICNIC_TWICE = "twice"
+CODE_PICNIC_NOT_ON_LIST = "not_on_list"
+CODE_PICNIC_SENT = "already_sent"
+CODE_PICNIC_MAYBE_SENT = "maybe_sent"
+CODE_PICNIC_NOT_TRIED = "not_tried"
+CODE_PICNIC_MAYBE_NO_UNDO = "maybe_no_undo"
 
 
 def error_message(err: Exception) -> str:

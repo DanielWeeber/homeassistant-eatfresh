@@ -6,6 +6,16 @@
 //   ?failonce=favorite (the named calls fail the first time only, like a short outage)
 //   ?empty=collection,planner
 //   ?today=YYYY-MM-DD (today of Home Assistant, default: the browser's day)
+// Shopping list to Picnic (0.4.0), all products invented:
+//   ?picnic=none       Picnic integration not set up
+//   ?picnic=nosearch   Picnic set up, but its product search is not available
+//   ?picnic=partial    every second entry of a send fails (partial success)
+//   ?picnic=used       some entries already have a product, one is in the cart, one is excluded
+//   ?picnic=noread     the cart cannot be read at the start of a send: the run does not start
+//   ?picnic=cartchanged  "undo" finds fewer pieces in the cart: nothing taken out, "maybe in the cart"
+//   ?fail=shopping,picnic_search,picnic_map,picnic_unmap,picnic_skip,picnic_send,picnic_undo
+//   ?failonce=picnic_send (fails the first time only)
+//   ?empty=shopping    the KitchenOwl shopping list is empty
 // The source "Küchengötter" always reports an error in the search, to show the banner.
 
 const pad = (n) => String(n).padStart(2, "0");
@@ -137,6 +147,81 @@ export function createMock(params = new URLSearchParams(location.search)) {
     return { week_start: start, today: now, days, unscheduled: plan.filter((p) => !p.date).map((p) => entry(p.id)) };
   };
 
+  // ---- shopping list to Picnic (invented products, cart in memory)
+  const picnicMode = new Set((params.get("picnic") ?? "").split(",").filter(Boolean));
+  const catalog = [
+    { id: "p-milch-1", name: "Frische Vollmilch 3,5 %", unit_quantity: "1 l", price: 119 },
+    { id: "p-milch-2", name: "Haltbare Milch 1,5 %", unit_quantity: "1 l", price: 99 },
+    { id: "p-milch-3", name: "Hafer-Drink ohne Milch", unit_quantity: "1 l", price: 189 },
+    { id: "p-mehl-1", name: "Weizenmehl Type 405", unit_quantity: "1 kg", price: 89 },
+    { id: "p-mehl-2", name: "Dinkelmehl Type 630", unit_quantity: "1 kg", price: 199 },
+    { id: "p-eier-1", name: "Eier aus Freilandhaltung", unit_quantity: "10 Stück", price: 329 },
+    { id: "p-eier-2", name: "Bio-Eier", unit_quantity: "6 Stück", price: 279 },
+    { id: "p-tomaten-1", name: "Gehackte Tomaten", unit_quantity: "400 g", price: 79 },
+    { id: "p-tomaten-2", name: "Strauchtomaten", unit_quantity: "500 g", price: 229 },
+    { id: "p-zwiebeln-1", name: "Gemüsezwiebeln", unit_quantity: "1 kg", price: 149 },
+    { id: "p-zwiebeln-2", name: "Rote Zwiebeln", unit_quantity: "500 g", price: 119 },
+    { id: "p-spaghetti-1", name: "Spaghetti Nr. 5", unit_quantity: "500 g", price: 139 },
+    { id: "p-spaghetti-2", name: "Vollkorn-Spaghetti", unit_quantity: "500 g", price: 169 },
+    { id: "p-basilikum-1", name: "Basilikum im Topf", unit_quantity: "1 Stück", price: null },
+    { id: "p-olivenoel-1", name: "Natives Olivenöl extra", unit_quantity: "750 ml", price: 799 },
+    { id: "p-parmesan-1", name: "Hartkäse am Stück, gereift, mit sehr langem Produktnamen zum Testen", unit_quantity: "4 x 250 g", price: 1249 },
+  ];
+  const shopping = empty.has("shopping") ? [] : [
+    { item_id: 501, name: "Milch", description: "1 l" },
+    { item_id: 502, name: "Mehl", description: "500 g" },
+    { item_id: 503, name: "Eier", description: "6" },
+    { item_id: 504, name: "Tomaten", description: "800 g" },
+    { item_id: 505, name: "Zwiebeln", description: "2" },
+    { item_id: 506, name: "Spaghetti", description: "1500g" },
+    { item_id: 507, name: "Basilikum", description: "1 Bund" },
+    { item_id: 508, name: "Olivenöl", description: "" },
+    { item_id: 509, name: "Salz", description: "" },
+    { item_id: 510, name: "Parmesan", description: "1kg" },
+  ];
+  const picnicMap = new Map();
+  const picnicSkip = new Set();
+  const picnicSent = new Map();
+  const cart = new Map();
+  if (picnicMode.has("used")) {
+    const p = (id) => catalog.find((c) => c.id === id);
+    picnicMap.set("milch", { product: p("p-milch-1"), amount: 1 });
+    picnicMap.set("mehl", { product: p("p-mehl-1"), amount: 1 });
+    picnicMap.set("spaghetti", { product: p("p-spaghetti-1"), amount: 3 });
+    picnicMap.set("parmesan", { product: p("p-parmesan-1"), amount: 1 });
+    picnicSkip.add("salz");
+    picnicSent.set(506, { product_id: "p-spaghetti-1", amount: 3, at: new Date(Date.now() - 40 * 60000).toISOString() });
+    cart.set("p-spaghetti-1", 3);
+  }
+  // Like the core's suggest_amount: "1500g" with "500 g" packs gives 3, otherwise 1.
+  const grams = (text) => {
+    const t = String(text).toLowerCase().replace(",", ".");
+    const m = t.match(/(?:(\d+)\s*x\s*)?(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b/);
+    if (!m) return null;
+    const n = Number(m[1] ?? 1) * Number(m[2]);
+    return { kg: 1000, l: 1000, g: 1, ml: 1 }[m[3]] * n;
+  };
+  const suggest = (description, unit) => {
+    const need = grams(description);
+    const pack = grams(unit);
+    if (!need || !pack) return 1;
+    return Math.min(20, Math.max(1, Math.ceil(need / pack - 0.01)));
+  };
+  const picnicCheck = (name) => {
+    if (fail.has(name) || failOnce.delete(name))
+      throw wsError("picnic_error", `Mock: ${name} failed`);
+  };
+  const picnicStatus = () =>
+    picnicMode.has("none")
+      ? { available: false, search: false, reason: "The Picnic integration is not set up in Home Assistant", reason_code: "not_set_up" }
+      : picnicMode.has("nosearch")
+        ? { available: true, search: false, reason: "The Picnic integration offers no product search", reason_code: "no_search" }
+        : { available: true, search: true, reason: null, reason_code: null };
+  const needPicnic = () => {
+    if (!picnicStatus().available) throw wsError("picnic_unavailable", "Picnic is not set up");
+  };
+  const stem = (w) => w.slice(0, Math.max(4, w.length - 2));
+
   const handlers = {
     "eatfresh/sources": () => {
       if (fail.has("sources")) throw wsError("unknown_error", "Mock: sources failed");
@@ -257,6 +342,105 @@ export function createMock(params = new URLSearchParams(location.search)) {
       if (ids.length) weekLists.set(w.week_start, at);
       return { added: ids.length * 6, recipes: ids.length, at: ids.length ? at : before ?? null };
     },
+    "eatfresh/shopping": () => {
+      check("shopping");
+      return {
+        picnic: picnicStatus(),
+        items: shopping.map((i) => {
+          const m = picnicMap.get(i.name.toLowerCase());
+          return {
+            ...i,
+            product: m?.product ?? null,
+            amount: m?.amount ?? 1,
+            skip: picnicSkip.has(i.name.toLowerCase()),
+            sent_at: picnicSent.get(i.item_id)?.at ?? null,
+            sent_uncertain: !!picnicSent.get(i.item_id)?.uncertain,
+          };
+        }),
+      };
+    },
+    "eatfresh/picnic/search": ({ query }) => {
+      needPicnic();
+      if (!picnicStatus().search) throw wsError("picnic_unavailable", "Search not available");
+      picnicCheck("picnic_search");
+      if (typeof query !== "string" || !query.trim() || query.length > 60) throw wsError("invalid_format", "Bad query");
+      const words = query.toLowerCase().split(/\s+/).filter(Boolean).map(stem);
+      return { products: catalog.filter((c) => words.some((w) => c.name.toLowerCase().includes(w))).slice(0, 8) };
+    },
+    "eatfresh/picnic/map": ({ name, product, amount }) => {
+      picnicCheck("picnic_map");
+      const key = name.toLowerCase();
+      const item = shopping.find((i) => i.name.toLowerCase() === key);
+      const value = amount ?? suggest(item?.description ?? "", product.unit_quantity);
+      if (value < 1 || value > 20) throw wsError("invalid_format", "Bad amount");
+      picnicMap.set(key, { product, amount: value });
+      picnicSkip.delete(key);
+      return {};
+    },
+    "eatfresh/picnic/unmap": ({ name }) => {
+      picnicCheck("picnic_unmap");
+      picnicMap.delete(name.toLowerCase());
+      return {};
+    },
+    "eatfresh/picnic/skip": ({ name, skip }) => {
+      picnicCheck("picnic_skip");
+      if (skip) picnicSkip.add(name.toLowerCase());
+      else picnicSkip.delete(name.toLowerCase());
+      return {};
+    },
+    "eatfresh/picnic/send": ({ items }) => {
+      needPicnic();
+      picnicCheck("picnic_send");
+      if (!Array.isArray(items) || items.length > 60) throw wsError("invalid_format", "Too many items");
+      // Like the core: the cart is read once at the start; without it the run does not start.
+      if (picnicMode.has("noread"))
+        throw wsError("picnic_error", "EatFresh could not read the Picnic cart and changed nothing; try again later", { translation_key: "picnic_cart_unreadable" });
+      const sent = [];
+      const failed = [];
+      // Like the core: the run stops at the first error of Picnic, the rest is not tried.
+      let stopped = false;
+      items.forEach((it, index) => {
+        if (stopped) return failed.push({ item_id: it.item_id, code: "not_tried", message: "Not sent: the transfer stopped at an error before" });
+        const onList = shopping.some((i) => i.item_id === it.item_id);
+        if (!onList || picnicSent.has(it.item_id)) return failed.push({ item_id: it.item_id, code: "not_on_list", message: "The entry is no longer on the shopping list" });
+        if (it.amount < 1 || it.amount > 20) throw wsError("invalid_format", "Bad amount");
+        if (picnicMode.has("partial") && index === 1) {
+          stopped = true;
+          return failed.push({ item_id: it.item_id, code: "not_added", message: "Picnic did not put the product into the cart" });
+        }
+        if (picnicMode.has("maybe") && index === 1) {
+          stopped = true;
+          picnicSent.set(it.item_id, { product_id: it.product_id, amount: it.amount, at: new Date().toISOString(), uncertain: true });
+          return failed.push({ item_id: it.item_id, code: "maybe_sent", message: "Picnic's answer does not show whether the product is in the cart" });
+        }
+        cart.set(it.product_id, (cart.get(it.product_id) ?? 0) + it.amount);
+        picnicSent.set(it.item_id, { product_id: it.product_id, amount: it.amount, at: new Date().toISOString() });
+        sent.push({ item_id: it.item_id, product_id: it.product_id, amount: it.amount });
+      });
+      return { sent, failed };
+    },
+    "eatfresh/picnic/undo": ({ item_id, remove }) => {
+      needPicnic();
+      picnicCheck("picnic_undo");
+      const s = picnicSent.get(item_id);
+      if (!s) throw wsError("not_found", "Not sent");
+      if (remove === false) {
+        picnicSent.delete(item_id);
+        return {};
+      }
+      // Like the core: "maybe in the cart" is never taken out.
+      if (s.uncertain) throw wsError("picnic_error", "EatFresh takes nothing out for an entry that is maybe in the cart", { translation_key: "picnic_maybe_no_undo" });
+      // Like the core: fewer pieces in the cart than put in, nothing is taken out, the entry becomes "maybe".
+      if (picnicMode.has("cartchanged")) {
+        picnicSent.set(item_id, { ...s, uncertain: true });
+        throw wsError("picnic_error", "The Picnic cart has fewer pieces than EatFresh put in", { translation_key: "picnic_cart_changed" });
+      }
+      const left = (cart.get(s.product_id) ?? 0) - s.amount;
+      if (left > 0) cart.set(s.product_id, left);
+      else cart.delete(s.product_id);
+      picnicSent.delete(item_id);
+      return {};
+    },
     "eatfresh/shopping_list/add": ({ kitchenowl_ids }) => {
       if (fail.has("shopping")) throw wsError("kitchenowl_error", "Mock: shopping failed");
       return { added: kitchenowl_ids.length * 6 };
@@ -264,6 +448,7 @@ export function createMock(params = new URLSearchParams(location.search)) {
   };
 
   window.mockCalls = [];
+  window.mockCart = cart;
   const hass = {
     language: lang,
     locale: { language: lang },

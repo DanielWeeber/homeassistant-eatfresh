@@ -22,6 +22,7 @@ from .const import (
     ATTR_DATE,
     ATTR_DAYS,
     ATTR_LIMIT,
+    ATTR_NAME_ONLY,
     ATTR_QUERY,
     ATTR_RECIPE_ID,
     ATTR_START_DATE,
@@ -84,6 +85,7 @@ SEARCH_COLLECTION_SCHEMA = vol.Schema(
         vol.Optional(ATTR_LIMIT, default=DEFAULT_COLLECTION_LIMIT): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=MAX_COLLECTION_LIMIT)
         ),
+        vol.Optional(ATTR_NAME_ONLY, default=False): cv.boolean,
     }
 )
 GET_PLANNER_SCHEMA = vol.Schema(
@@ -178,10 +180,14 @@ async def _async_search_collection(
 ) -> ServiceResponse:
     """Return the recipes of the collection (name or ingredient matching).
 
+    With ``name_only`` the query only matches the name.
+
     ``total`` counts all matches, ``recipes`` holds at most ``limit`` of them.
     """
     recipes, total = await data.async_search_collection(
-        call.data.get(ATTR_QUERY), call.data[ATTR_LIMIT]
+        call.data.get(ATTR_QUERY),
+        call.data[ATTR_LIMIT],
+        name_only=call.data.get(ATTR_NAME_ONLY, False),
     )
     return {"recipes": recipes, "total": total}
 

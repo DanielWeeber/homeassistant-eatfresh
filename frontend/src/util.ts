@@ -1,5 +1,5 @@
-import type { Lang } from "./i18n";
-import { translate } from "./i18n";
+import type { Lang, StringKey } from "./i18n";
+import { hasText, translate } from "./i18n";
 import type { Ingredient, View, WsError } from "./types";
 
 /** Format a duration in minutes for display. */
@@ -53,6 +53,16 @@ export function isHttpUrl(text: string): boolean {
   }
 }
 
+/**
+ * Text for a Picnic code (a reason of the status, a failed entry or the
+ * translation_key `picnic_<code>` of an error), in the language of the panel.
+ * Unknown codes fall back to the general Picnic error, never to English.
+ */
+export function picnicText(lang: Lang, code: string | null | undefined): string {
+  const key = `picnic_code_${code ?? ""}`;
+  return translate(lang, hasText(key) ? (key as StringKey) : "picnic_code_error");
+}
+
 /** Map a WebSocket error to a translated, user friendly message. */
 export function errorText(lang: Lang, err: unknown): string {
   const e = (err ?? {}) as WsError;
@@ -62,11 +72,19 @@ export function errorText(lang: Lang, err: unknown): string {
     case "source_blocked":
       return translate(lang, "err_source_blocked");
     case "not_found":
-      return translate(lang, "err_not_found");
+      return e.translation_key === "picnic_nothing_to_undo"
+        ? picnicText(lang, "nothing_to_undo")
+        : translate(lang, "err_not_found");
     case "kitchenowl_error":
       return translate(lang, "err_kitchenowl_error");
     case "kitchenowl_auth":
       return translate(lang, "err_kitchenowl_auth");
+    case "picnic_unavailable":
+      return e.translation_key?.startsWith("picnic_")
+        ? picnicText(lang, e.translation_key.slice(7))
+        : translate(lang, "err_picnic_unavailable");
+    case "picnic_error":
+      return picnicText(lang, e.translation_key?.startsWith("picnic_") ? e.translation_key.slice(7) : "error");
     default:
       return e.message || translate(lang, "err_unknown");
   }
@@ -89,6 +107,8 @@ export function parsePath(path: string): View {
     }
     case "planner":
       return { name: "planner" };
+    case "shopping":
+      return { name: "shopping" };
     case "recipe": {
       const key = decode(parts.slice(1).join("/"));
       return key ? { name: "recipe", key } : { name: "search" };
@@ -105,6 +125,7 @@ export function parsePath(path: string): View {
 export function viewPath(view: View): string {
   if (view.name === "collection") return "/collection";
   if (view.name === "planner") return "/planner";
+  if (view.name === "shopping") return "/shopping";
   if (view.name === "korecipe") return `/collection/${view.id}`;
   if (view.name === "recipe") {
     if (view.key) return `/recipe/${encodeURIComponent(view.key)}`;
@@ -160,4 +181,10 @@ export function formatWeek(lang: Lang, monday: string): string {
   const b = parseDate(addDays(monday, 6));
   const fmt = new Intl.DateTimeFormat(locale(lang), { day: "numeric", month: "long", year: "numeric" });
   return fmt.formatRange(a, b);
+}
+
+/** Picnic price in cent as text: "1,19 €" in German, "€1.19" in English. */
+export function formatPrice(lang: Lang, cents: number | null | undefined): string {
+  if (cents == null || !Number.isFinite(cents)) return "";
+  return new Intl.NumberFormat(locale(lang), { style: "currency", currency: "EUR" }).format(cents / 100);
 }

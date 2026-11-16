@@ -681,3 +681,37 @@ async def test_ws_planner_still_uses_cache(
     msg = await ws.call("eatfresh/planner")
     assert msg["success"]
     assert mock_client.list_planner.await_count == before
+
+
+@pytest.mark.parametrize(
+    ("query", "name_only", "ids"),
+    [
+        ("tomaten", True, []),
+        ("tomaten", False, [11, 13]),
+        ("soup", True, [11]),
+        ("", True, [11, 12, 13]),
+    ],
+)
+async def test_search_collection_name_only(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    recipes: MagicMock,
+    query: str,
+    name_only: bool,
+    ids: list[int],
+) -> None:
+    """With name_only the query only matches the name (wish of 0.4.0)."""
+    response = await call(
+        hass, "search_collection", query=query, name_only=name_only
+    )
+    assert [r["recipe_id"] for r in response["recipes"]] == ids
+    assert response["total"] == len(ids)
+
+
+async def test_search_collection_name_only_default_off(
+    hass: HomeAssistant, init_integration: MockConfigEntry, recipes: MagicMock
+) -> None:
+    response = await call(hass, "search_collection", query="hefe")
+    assert [r["recipe_id"] for r in response["recipes"]] == [12]
+    with pytest.raises(vol.Invalid):
+        await call(hass, "search_collection", query="hefe", name_only="maybe")

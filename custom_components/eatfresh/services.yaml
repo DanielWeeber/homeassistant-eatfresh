@@ -33,6 +33,11 @@ search_collection:
           min: 1
           max: 200
           mode: box
+    name_only:
+      required: false
+      default: false
+      selector:
+        boolean:
 
 get_planner:
   fields:

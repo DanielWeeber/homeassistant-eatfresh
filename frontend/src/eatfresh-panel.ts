@@ -4,6 +4,9 @@ import {
   mdiBookOpenPageVariantOutline,
   mdiCalendarPlus,
   mdiCalendarWeek,
+  mdiCancel,
+  mdiCartCheck,
+  mdiCartOutline,
   mdiCartPlus,
   mdiCheck,
   mdiCheckCircleOutline,
@@ -11,17 +14,25 @@ import {
   mdiChevronRight,
   mdiClockOutline,
   mdiClose,
+  mdiDotsVertical,
   mdiEyeOffOutline,
   mdiEyeOutline,
   mdiHeart,
   mdiHeartOutline,
+  mdiInformationOutline,
   mdiLinkVariant,
+  mdiLinkVariantOff,
   mdiMagnify,
   mdiMenu,
+  mdiMinus,
   mdiOpenInNew,
   mdiPlus,
+  mdiRefresh,
   mdiSilverwareForkKnife,
+  mdiStorefrontOutline,
+  mdiSwapHorizontal,
   mdiTagMultipleOutline,
+  mdiUndoVariant,
 } from "@mdi/js";
 import { LitElement, html, nothing, svg, type PropertyValues, type TemplateResult } from "lit";
 import { property, query, state } from "lit/decorators.js";
@@ -33,11 +44,15 @@ import type {
   CollectionRecipeResponse,
   HomeAssistant,
   PanelRoute,
+  PicnicProduct,
+  PicnicSendResponse,
   PlannerEntry,
   PlannerResponse,
   Recipe,
   RecipeResponse,
   SearchHit,
+  ShoppingItem,
+  ShoppingResponse,
   SourceErrorInfo,
   SourceInfo,
   Tab,
@@ -51,12 +66,14 @@ import {
   errorText,
   formatDay,
   formatMinutes,
+  formatPrice,
   formatWeek,
   hostOf,
   ingredientQty,
   isHttpUrl,
   mondayOf,
   parsePath,
+  picnicText,
   today,
   viewPath,
   weekdayName,
@@ -92,11 +109,29 @@ type Dialog =
     }
   | { kind: "plan"; id: number; name: string; image: string | null }
   | { kind: "pick"; date: string }
-  | { kind: "week_again"; week: string; at: string };
+  | { kind: "week_again"; week: string; at: string }
+  | {
+      kind: "product";
+      item_id: number;
+      name: string;
+      query: string;
+      state: Load;
+      products: PicnicProduct[];
+      error: string;
+    }
+  | { kind: "item_menu"; item_id: number }
+  | { kind: "send"; n: number };
 
 const WIDE_MIN = 600;
+const ROOMY_MIN = 960;
 const TOAST_MS = 4500;
 const UNDO_MS = 7000;
+/** Codes of entries the core leaves out without a call to Picnic (no stop). */
+const LIST_CODES = new Set(["twice", "not_on_list", "already_sent"]);
+/** Limits of `eatfresh/picnic/send`: at most 60 entries, 1 to 20 pieces each. */
+const SEND_MAX = 60;
+const AMOUNT_MAX = 20;
+const AMOUNT_SAVE_MS = 700;
 
 const icon = (path: string, cls = "i") =>
   html`<svg class=${cls} viewBox="0 0 24 24" aria-hidden="true">${svg`<path d=${path}></path>`}</svg>`;
@@ -127,6 +162,8 @@ export class EatFreshPanel extends LitElement {
 
   @state() private _lang: Lang = "en";
   @state() private _wide = false;
+  /** Room for text labels on the top bar (four tabs and the link button). */
+  @state() private _roomy = false;
   @state() private _view: View = { name: "search" };
   @state() private _tab: Tab = "search";
 
@@ -181,6 +218,18 @@ export class EatFreshPanel extends LitElement {
   @state() private _busy = new Set<number>();
   @state() private _toast?: Toast;
 
+  @state() private _shop?: ShoppingResponse;
+  @state() private _shopState: Load = "idle";
+  @state() private _shopError = "";
+  @state() private _shopLoading = false;
+  /** Entries the user unticked (everything with a product is ticked by default). */
+  @state() private _unpicked = new Set<number>();
+  @state() private _itemBusy = new Set<number>();
+  @state() private _itemErrors = new Map<number, string>();
+  @state() private _showSkipped = false;
+  @state() private _sending = false;
+  @state() private _sendNotice?: { kind: "partial" | "error"; text: string };
+
   @query("dialog") private _dialogEl?: HTMLDialogElement;
 
   private _hass?: HomeAssistant;
@@ -201,6 +250,11 @@ export class EatFreshPanel extends LitElement {
   private _todayKnown = false;
   /** True once the person has chosen a week; until then the core picks it. */
   private _weekChosen = false;
+  private _shopSeq = 0;
+  private _shopStale = true;
+  private _productSeq = 0;
+  private _pendingAmounts = new Map<string, number>();
+  private _amountTimers = new Map<string, number>();
 
   get hass(): HomeAssistant | undefined {
     return this._hass;
@@ -226,6 +280,8 @@ export class EatFreshPanel extends LitElement {
       const width = entries[0]?.contentRect.width ?? 0;
       const wide = width >= WIDE_MIN;
       if (wide !== this._wide) this._wide = wide;
+      const roomy = width >= ROOMY_MIN;
+      if (roomy !== this._roomy) this._roomy = roomy;
     });
     this._resize.observe(this);
   }
@@ -235,6 +291,12 @@ export class EatFreshPanel extends LitElement {
     window.removeEventListener("popstate", this._onPopState);
     this._resize?.disconnect();
     this._clearToast();
+    // Save quantities that are still waiting.
+    for (const [key, timer] of this._amountTimers) {
+      window.clearTimeout(timer);
+      const name = this._shop?.items.find((i) => lower(i.name) === key)?.name;
+      if (name) void this._saveAmount(name);
+    }
   }
 
   protected willUpdate(changed: PropertyValues<this>): void {
@@ -288,7 +350,8 @@ export class EatFreshPanel extends LitElement {
   }
 
   private _applyView(view: View): void {
-    if (!this._sameView(this._view, view)) {
+    const changed = !this._sameView(this._view, view);
+    if (changed) {
       this._view = view;
       // A hint belongs to the view it came from; do not carry it along.
       this._clearToast();
@@ -296,7 +359,8 @@ export class EatFreshPanel extends LitElement {
       this._dialog = undefined;
       this.renderRoot.querySelector("main")?.scrollTo({ top: 0 });
     }
-    if (view.name === "search" || view.name === "collection" || view.name === "planner") this._tab = view.name;
+    if (view.name === "search" || view.name === "collection" || view.name === "planner" || view.name === "shopping")
+      this._tab = view.name;
     else if (view.name === "korecipe" && this._tab === "search") this._tab = "collection";
     if (!this._hass) return;
     if (view.name === "recipe") this._loadRecipe(view);
@@ -304,6 +368,9 @@ export class EatFreshPanel extends LitElement {
     if (view.name === "collection" && (this._collectionStale || this._collectionState === "error"))
       this._loadCollection();
     if (view.name === "planner" && (this._plannerStale || this._plannerState === "error")) this._loadPlanner();
+    // Read the list again each time the tab opens (KitchenOwl and the store only, never Picnic).
+    if (view.name === "shopping" && !this._shopLoading && (changed || this._shopStale || !this._shop || this._shopState === "error"))
+      this._loadShopping(!!this._shop);
   }
 
   private _back(): void {
@@ -698,6 +765,7 @@ export class EatFreshPanel extends LitElement {
         "ok",
       );
       if (this._view.name === "collection") this._selected = new Set();
+      this._shopStale = true;
     } catch (err) {
       const done = this._partialDone(err);
       if (done > 0) {
@@ -742,6 +810,7 @@ export class EatFreshPanel extends LitElement {
         return;
       }
       if (res.at) this._setWeekListTime(week, res.at);
+      this._shopStale = true;
       const n = res.added ?? 0;
       const r = res.recipes ?? 0;
       this._showToast(
@@ -1003,6 +1072,354 @@ export class EatFreshPanel extends LitElement {
     if (this._collectionStale || this._collectionState !== "done") this._loadCollection();
   }
 
+  // ---- shopping list to Picnic
+
+  /** Load the list (KitchenOwl and the store only, never Picnic). `quiet` keeps what is shown. */
+  private async _loadShopping(quiet = false): Promise<void> {
+    const seq = ++this._shopSeq;
+    this._shopLoading = true;
+    if (!quiet || !this._shop) this._shopState = "loading";
+    try {
+      const res = await this._ws<ShoppingResponse>({ type: "eatfresh/shopping" });
+      if (seq !== this._shopSeq) return;
+      // Quantities typed a moment ago win over the stored ones until they are saved.
+      const items = res.items.map((i) => {
+        const pending = this._pendingAmounts.get(lower(i.name));
+        return pending != null && i.product ? { ...i, amount: pending } : i;
+      });
+      this._shop = { ...res, items };
+      this._shopState = "done";
+      this._shopStale = false;
+      const open = new Set(items.filter((i) => !i.sent_at && !i.skip).map((i) => i.item_id));
+      this._itemErrors = new Map([...this._itemErrors].filter(([id]) => open.has(id)));
+    } catch (err) {
+      if (seq !== this._shopSeq) return;
+      this._shopError = this._err(err);
+      if (quiet && this._shop) this._showToast(`${this._t("shop_failed")} ${this._shopError}`, "error");
+      else this._shopState = "error";
+    } finally {
+      if (seq === this._shopSeq) this._shopLoading = false;
+    }
+  }
+
+  private _isPicked(item: ShoppingItem): boolean {
+    return !!item.product && !item.skip && !item.sent_at && !this._unpicked.has(item.item_id);
+  }
+
+  private get _pickedItems(): ShoppingItem[] {
+    return (this._shop?.items ?? []).filter((i) => this._isPicked(i));
+  }
+
+  private _item(id: number): ShoppingItem | undefined {
+    return this._shop?.items.find((i) => i.item_id === id);
+  }
+
+  /** The store keys products by ingredient name: entries with the same name change together. */
+  private _patchByName(name: string, patch: Partial<ShoppingItem>): void {
+    if (!this._shop) return;
+    const key = lower(name);
+    this._shop = {
+      ...this._shop,
+      items: this._shop.items.map((i) => {
+        if (lower(i.name) !== key) return i;
+        // A sent entry keeps the quantity that is in the cart (and that "undo" takes out).
+        if (i.sent_at && "amount" in patch) {
+          const { amount: _ignored, ...rest } = patch;
+          return { ...i, ...rest };
+        }
+        return { ...i, ...patch };
+      }),
+    };
+  }
+
+  private _patchItem(id: number, patch: Partial<ShoppingItem>): void {
+    if (!this._shop) return;
+    this._shop = { ...this._shop, items: this._shop.items.map((i) => (i.item_id === id ? { ...i, ...patch } : i)) };
+  }
+
+  private _setPicked(id: number, on: boolean): void {
+    const next = new Set(this._unpicked);
+    if (on) next.delete(id);
+    else next.add(id);
+    this._unpicked = next;
+  }
+
+  private _setItemBusy(id: number, on: boolean): void {
+    const next = new Set(this._itemBusy);
+    if (on) next.add(id);
+    else next.delete(id);
+    this._itemBusy = next;
+  }
+
+  private _clearItemError(id: number): void {
+    if (!this._itemErrors.has(id)) return;
+    const next = new Map(this._itemErrors);
+    next.delete(id);
+    this._itemErrors = next;
+  }
+
+  private _openProduct(item: ShoppingItem): void {
+    this._productSeq++;
+    this._dialog = {
+      kind: "product",
+      item_id: item.item_id,
+      name: item.name,
+      query: item.name.slice(0, 60),
+      state: "idle",
+      products: [],
+      error: "",
+    };
+  }
+
+  /** Searches Picnic. Only ever called from a tap on "Search" or Enter. */
+  private async _productSearch(): Promise<void> {
+    const d = this._dialog;
+    if (d?.kind !== "product" || !this._shop?.picnic.search) return;
+    const query = d.query.trim().slice(0, 60);
+    if (!query) return;
+    const seq = ++this._productSeq;
+    this._dialog = { ...d, state: "loading", error: "" };
+    try {
+      const res = await this._ws<{ products: PicnicProduct[] }>({ type: "eatfresh/picnic/search", query });
+      const now = this._dialog;
+      if (seq !== this._productSeq || now?.kind !== "product") return;
+      this._dialog = { ...now, state: "done", products: res.products ?? [] };
+    } catch (err) {
+      const now = this._dialog;
+      if (seq !== this._productSeq || now?.kind !== "product") return;
+      this._dialog = { ...now, state: "error", error: this._err(err) };
+    }
+  }
+
+  /** Remember a product for an ingredient. Without `amount` the core suggests one. */
+  private async _mapProduct(item: ShoppingItem, product: PicnicProduct, undoable = true, amount?: number): Promise<void> {
+    const before = this._item(item.item_id) ?? item;
+    const old = { product: before.product, amount: before.amount };
+    if (this._dialog?.kind === "product") this._dialog = undefined;
+    this._pendingAmounts.delete(lower(item.name));
+    this._patchByName(item.name, { product, amount: amount ?? 1, skip: false });
+    this._setPicked(item.item_id, true);
+    this._clearItemError(item.item_id);
+    try {
+      await this._ws({ type: "eatfresh/picnic/map", name: item.name, product, ...(amount != null ? { amount } : {}) });
+      // Fetch the suggested quantity (store only, no call to Picnic).
+      if (amount == null) void this._loadShopping(true);
+      if (undoable)
+        this._showToast(this._t("mapped", { name: item.name, product: product.name }), "ok", {
+          ms: UNDO_MS,
+          action: {
+            label: this._t("undo"),
+            run: () => {
+              const now = { ...item, product };
+              if (old.product) void this._mapProduct(now, old.product, false, old.amount);
+              else void this._unmap(now, false);
+            },
+          },
+        });
+    } catch (err) {
+      this._patchByName(item.name, old);
+      this._showToast(this._t("map_failed", { message: this._err(err) }), "error");
+    }
+  }
+
+  private async _unmap(item: ShoppingItem, undoable = true): Promise<void> {
+    const before = this._item(item.item_id) ?? item;
+    const old = { product: before.product, amount: before.amount };
+    if (!old.product) return;
+    this._pendingAmounts.delete(lower(item.name));
+    this._patchByName(item.name, { product: null, amount: 1 });
+    this._clearItemError(item.item_id);
+    try {
+      await this._ws({ type: "eatfresh/picnic/unmap", name: item.name });
+      if (undoable)
+        this._showToast(this._t("forgot", { name: item.name }), "ok", {
+          ms: UNDO_MS,
+          action: { label: this._t("undo"), run: () => void this._mapProduct({ ...item, product: null }, old.product!, false, old.amount) },
+        });
+    } catch (err) {
+      this._patchByName(item.name, old);
+      this._showToast(this._t("forget_failed", { message: this._err(err) }), "error");
+    }
+  }
+
+  private async _setSkip(item: ShoppingItem, skip: boolean, undoable = true): Promise<void> {
+    this._patchByName(item.name, { skip });
+    this._clearItemError(item.item_id);
+    try {
+      await this._ws({ type: "eatfresh/picnic/skip", name: item.name, skip });
+      if (undoable)
+        this._showToast(this._t(skip ? "skipped_done" : "unskipped_done", { name: item.name }), "ok", {
+          ms: UNDO_MS,
+          action: { label: this._t("undo"), run: () => void this._setSkip({ ...item, skip }, !skip, false) },
+        });
+    } catch (err) {
+      this._patchByName(item.name, { skip: !skip });
+      this._showToast(this._t("skip_failed", { message: this._err(err) }), "error");
+    }
+  }
+
+  /** Quantity changes show at once and are saved a moment later (one call per burst of taps). */
+  private _setAmount(item: ShoppingItem, amount: number): void {
+    if (!item.product) return;
+    const value = Math.min(AMOUNT_MAX, Math.max(1, Math.round(amount)));
+    const key = lower(item.name);
+    this._patchByName(item.name, { amount: value });
+    this._pendingAmounts.set(key, value);
+    window.clearTimeout(this._amountTimers.get(key));
+    this._amountTimers.set(
+      key,
+      window.setTimeout(() => void this._saveAmount(item.name), AMOUNT_SAVE_MS),
+    );
+  }
+
+  private async _saveAmount(name: string): Promise<void> {
+    const key = lower(name);
+    this._amountTimers.delete(key);
+    const amount = this._pendingAmounts.get(key);
+    const product = this._shop?.items.find((i) => lower(i.name) === key)?.product;
+    if (amount == null || !product) return;
+    try {
+      await this._ws({ type: "eatfresh/picnic/map", name, product, amount });
+    } catch (err) {
+      this._showToast(this._t("amount_failed", { message: this._err(err) }), "error");
+    } finally {
+      if (this._pendingAmounts.get(key) === amount) this._pendingAmounts.delete(key);
+    }
+  }
+
+  private _askSend(): void {
+    const n = this._pickedItems.length;
+    if (!n || this._sending) return;
+    this._dialog = { kind: "send", n };
+  }
+
+  /** Puts the ticked products into the Picnic cart. Never orders. */
+  private async _send(): Promise<void> {
+    const items = this._pickedItems;
+    this._dialog = undefined;
+    if (!items.length || this._sending) return;
+    this._sending = true;
+    this._sendNotice = undefined;
+    this._clearToast();
+    const sent: PicnicSendResponse["sent"] = [];
+    const failed: PicnicSendResponse["failed"] = [];
+    let fatal: unknown;
+    // The core stops a run at the first error of Picnic; then no further chunk goes.
+    let stopped = false;
+    for (let i = 0; i < items.length; i += SEND_MAX) {
+      const chunk = items.slice(i, i + SEND_MAX);
+      if (fatal) {
+        failed.push(...chunk.map((c) => ({ item_id: c.item_id, message: this._err(fatal) })));
+        continue;
+      }
+      if (stopped) {
+        failed.push(...chunk.map((c) => ({ item_id: c.item_id, code: "not_tried", message: picnicText(this._lang, "not_tried") })));
+        continue;
+      }
+      try {
+        const res = await this._ws<PicnicSendResponse>({
+          type: "eatfresh/picnic/send",
+          items: chunk.map((c) => ({ item_id: c.item_id, product_id: c.product!.id, amount: c.amount })),
+        });
+        sent.push(...(res.sent ?? []));
+        failed.push(...(res.failed ?? []));
+        if ((res.failed ?? []).some((f) => !f.code || !LIST_CODES.has(f.code))) stopped = true;
+      } catch (err) {
+        // Stop at once (for example a login error); the rest is not tried.
+        fatal = err;
+        failed.push(...chunk.map((c) => ({ item_id: c.item_id, message: this._err(err) })));
+      }
+    }
+    const at = new Date().toISOString();
+    const sentIds = new Set(sent.map((s) => s.item_id));
+    // Picnic did not answer in time: maybe in the cart. The core marked them,
+    // so they are never sent again by themselves; show them as "maybe in the cart".
+    const maybe = failed.filter((f) => f.code === "maybe_sent");
+    const maybeIds = new Set(maybe.map((f) => f.item_id));
+    const other = failed.filter((f) => !maybeIds.has(f.item_id));
+    if (this._shop)
+      this._shop = {
+        ...this._shop,
+        items: this._shop.items.map((i) =>
+          sentIds.has(i.item_id)
+            ? { ...i, sent_at: at, sent_uncertain: false }
+            : maybeIds.has(i.item_id)
+              ? { ...i, sent_at: at, sent_uncertain: true }
+              : i,
+        ),
+      };
+    // Messages of the core come as codes; the panel says them in its own language.
+    this._itemErrors = new Map(other.map((f) => [f.item_id, f.code ? picnicText(this._lang, f.code) : f.message]));
+    this._sending = false;
+    const total = items.length;
+    if (sent.length && !failed.length) {
+      const ids = [...sentIds];
+      this._showToast(
+        sent.length === 1 ? this._t("send_done_one") : this._t("send_done", { n: sent.length }),
+        "ok",
+        { ms: UNDO_MS, action: { label: this._t("undo"), run: () => void this._undoAll(ids) } },
+      );
+    } else if (sent.length || maybe.length) {
+      const parts: string[] = [];
+      if (sent.length) parts.push(this._t("send_partial_head", { done: sent.length, total }));
+      if (maybe.length)
+        parts.push(maybe.length === 1 ? this._t("send_maybe_one") : this._t("send_maybe", { n: maybe.length }));
+      if (other.length)
+        parts.push(
+          other.length === 1 ? this._t("send_partial_rest_one") : this._t("send_partial_rest", { failed: other.length }),
+        );
+      if (failed.some((f) => f.code === "not_tried")) parts.push(this._t("send_stopped"));
+      this._sendNotice = { kind: "partial", text: parts.join(" ") };
+    } else {
+      const first = other[0];
+      const message = fatal
+        ? this._err(fatal)
+        : first
+          ? first.code
+            ? picnicText(this._lang, first.code)
+            : first.message
+          : this._t("err_unknown");
+      this._sendNotice = { kind: "error", text: this._t("send_failed", { message }) };
+    }
+    // The core answered for fewer entries than sent (for example, one left the list): read it again.
+    if (!fatal && sent.length + failed.length < total) void this._loadShopping(true);
+  }
+
+  /**
+   * Takes an entry out of the Picnic cart again. With `remove` false only the
+   * mark goes (no call to Picnic): for "maybe in the cart" that was not there.
+   */
+  private async _undo(item: ShoppingItem, quiet = false, remove = true): Promise<boolean> {
+    const id = item.item_id;
+    if (this._itemBusy.has(id)) return false;
+    this._setItemBusy(id, true);
+    try {
+      await this._ws(remove ? { type: "eatfresh/picnic/undo", item_id: id } : { type: "eatfresh/picnic/undo", item_id: id, remove: false });
+      this._patchItem(id, { sent_at: null, sent_uncertain: false });
+      // Back on the list, but not ticked: it only goes again on purpose.
+      this._setPicked(id, false);
+      if (!quiet)
+        this._showToast(this._t(remove ? "undo_done" : "not_in_cart_done", { name: item.name }), "ok");
+      return true;
+    } catch (err) {
+      this._showToast(this._t("auto_undo_failed", { message: this._err(err) }), "error");
+      // After an unclear answer the core shows the entry as "maybe in the cart": read it again.
+      if (remove) void this._loadShopping(true);
+      return false;
+    } finally {
+      this._setItemBusy(id, false);
+    }
+  }
+
+  private async _undoAll(ids: number[]): Promise<void> {
+    for (const id of ids) {
+      const item = this._item(id);
+      if (!item?.sent_at) continue;
+      if (!(await this._undo(item, true))) return;
+    }
+    this._showToast(this._t("undo_all_done"), "ok");
+  }
+
   // ---- toast
 
   private _showToast(
@@ -1040,6 +1457,7 @@ export class EatFreshPanel extends LitElement {
       ["search", mdiMagnify, "nav_search"],
       ["collection", mdiBookOpenPageVariantOutline, "nav_collection"],
       ["planner", mdiCalendarWeek, "nav_planner"],
+      ["shopping", mdiCartOutline, "nav_shopping"],
     ];
     const nav = tabs.map(
       ([tab, ico, label]) => html`<button
@@ -1051,7 +1469,7 @@ export class EatFreshPanel extends LitElement {
       </button>`,
     );
     return html`
-      <div class="shell ${this._wide ? "wide" : "narrow"}">
+      <div class="shell ${this._wide ? "wide" : "narrow"} ${this._wide && !this._roomy ? "mid" : ""}">
         <header class="top">
           ${this.narrow
             ? html`<button class="icon-btn" aria-label=${this._t("menu")} @click=${this._toggleMenu}>
@@ -1063,7 +1481,7 @@ export class EatFreshPanel extends LitElement {
             ? html`<nav class="top-nav" aria-label=${this._t("nav_label")}>${nav}</nav>`
             : nothing}
           <button
-            class="link-btn ${this._wide ? "btn" : "icon-btn"}"
+            class="link-btn ${this._roomy ? "btn" : "icon-btn"}"
             aria-label=${this._t("link_title")}
             title=${this._t("link_title")}
             aria-haspopup="dialog"
@@ -1072,7 +1490,7 @@ export class EatFreshPanel extends LitElement {
               this._dialog = { kind: "link" };
             }}
           >
-            ${icon(mdiLinkVariant)}${this._wide ? html`<span>${this._t("link_open")}</span>` : nothing}
+            ${icon(mdiLinkVariant)}${this._roomy ? html`<span>${this._t("link_open")}</span>` : nothing}
           </button>
         </header>
         <div class="body">
@@ -1086,7 +1504,9 @@ export class EatFreshPanel extends LitElement {
                     ? this._renderKoRecipe()
                     : v === "planner"
                       ? this._renderPlanner()
-                      : this._renderCollection()}
+                      : v === "shopping"
+                        ? this._renderShopping()
+                        : this._renderCollection()}
             </div>
           </main>
           ${this._renderToast()}
@@ -1770,6 +2190,338 @@ export class EatFreshPanel extends LitElement {
     </li>`;
   }
 
+  // ---- shopping view (Picnic)
+
+  private _formatSent(iso: string): string {
+    const when = new Date(iso);
+    if (Number.isNaN(when.getTime())) return iso;
+    const options: Intl.DateTimeFormatOptions = { weekday: "short", hour: "2-digit", minute: "2-digit" };
+    const zone = this._hass?.config?.time_zone;
+    try {
+      return when.toLocaleString(this._lang, zone ? { ...options, timeZone: zone } : options);
+    } catch {
+      return when.toLocaleString(this._lang, options);
+    }
+  }
+
+  private _productMeta(p: PicnicProduct): string {
+    const price = p.price == null ? this._t("shop_price_unknown") : formatPrice(this._lang, p.price);
+    return [p.unit_quantity, price].filter(Boolean).join(" · ");
+  }
+
+  private _shopSkeleton(): TemplateResult {
+    return html`<ul class="shop-list" aria-busy="true" aria-label=${this._t("loading")}>
+      ${Array.from(
+        { length: 5 },
+        () => html`<li class="shop-item"><span></span><div class="shop-body"><div class="skel line"></div><div class="skel line short"></div></div></li>`,
+      )}
+    </ul>`;
+  }
+
+  private _renderShopping(): TemplateResult {
+    const shop = this._shop;
+    if (!shop && this._shopState === "error")
+      return this._note(`${this._t("shop_failed")} ${this._shopError}`, mdiAlertCircleOutline, () => this._loadShopping());
+    if (!shop) return html`<p class="intro">${this._t("shop_intro")}</p>${this._shopSkeleton()}`;
+    if (!shop.picnic.available) {
+      // Set up but not running is a different message than "not set up".
+      const off = shop.picnic.reason_code === "not_loaded";
+      return html`<div class="shop"><section class="explain" role="note">
+        ${icon(mdiStorefrontOutline)}
+        <h2>${this._t(off ? "shop_picnic_off_title" : "shop_no_picnic_title")}</h2>
+        <p>${this._t(off ? "shop_picnic_off" : "shop_no_picnic")}</p>
+        ${shop.picnic.reason_code && shop.picnic.reason_code !== "not_set_up" && !off
+          ? html`<p class="reason">${this._t("shop_reason", { reason: picnicText(this._lang, shop.picnic.reason_code) })}</p>`
+          : nothing}
+      </section></div>`;
+    }
+    const items = shop.items;
+    const reload = html`<button
+      class="icon-btn"
+      aria-label=${this._t("shop_refresh")}
+      title=${this._t("shop_refresh")}
+      ?disabled=${this._shopLoading || this._sending}
+      @click=${() => this._loadShopping(true)}
+    >
+      ${icon(mdiRefresh)}
+    </button>`;
+    if (!items.length)
+      return html`<div class="shop">
+        <div class="note">
+          ${icon(mdiCartOutline)}
+          <div>${this._t("shop_empty")}</div>
+          <button class="btn" ?disabled=${this._shopLoading} @click=${() => this._loadShopping(true)}>
+            ${icon(mdiRefresh)}<span>${this._t("shop_refresh")}</span>
+          </button>
+        </div>
+      </div>`;
+    const open = items.filter((i) => !i.sent_at && !i.skip);
+    const sent = items.filter((i) => !!i.sent_at);
+    const skipped = items.filter((i) => !i.sent_at && i.skip);
+    const missing = open.filter((i) => !i.product).length;
+    const n = this._pickedItems.length;
+    const firstTime = open.length > 0 && missing === open.length && sent.length === 0;
+    const notice = this._sendNotice;
+    return html`<div class="shop">
+      <div class="action-bar shop-bar">
+        <button
+          class="btn primary grow send"
+          ?disabled=${n === 0 || this._sending}
+          aria-label=${`${this._t("shop_send")} (${n})`}
+          @click=${() => this._askSend()}
+        >
+          ${icon(mdiCartPlus)}<span>${this._sending ? this._t("sending") : this._t("shop_send")}</span>
+          ${this._sending ? nothing : html`<span class="count-badge" aria-hidden="true">${n}</span>`}
+        </button>
+        ${reload}
+      </div>
+      <p class="shop-status" role="status">
+        ${open.length
+          ? missing
+            ? missing === 1
+              ? this._t("shop_open_one")
+              : this._t("shop_open", { n: missing })
+            : this._t("shop_all_mapped")
+          : nothing}
+        ${open.length && !n ? html`<span class="sub">${this._t("shop_none_picked")}</span>` : nothing}
+      </p>
+      ${firstTime ? html`<p class="intro">${this._t("shop_intro")}</p>` : nothing}
+      ${shop.picnic.search
+        ? nothing
+        : html`<div class="banner info">
+            ${icon(mdiInformationOutline)}<span
+              >${this._t("shop_no_search")}${shop.picnic.reason_code
+                ? html` ${this._t("shop_reason", { reason: picnicText(this._lang, shop.picnic.reason_code) })}`
+                : nothing}</span
+            >
+          </div>`}
+      ${notice
+        ? html`<div class="banner ${notice.kind}" role="alert">
+            ${icon(mdiAlertCircleOutline)}<span>${notice.text}</span>
+            <button class="icon-btn" aria-label=${this._t("close")} @click=${() => (this._sendNotice = undefined)}>
+              ${icon(mdiClose)}
+            </button>
+          </div>`
+        : nothing}
+      ${open.length
+        ? html`<ul class="shop-list">${open.map((i) => this._renderShopItem(i))}</ul>`
+        : html`<div class="note">${icon(mdiCartCheck)}<div>${this._t("shop_all_done")}</div></div>`}
+      ${sent.length
+        ? html`<h2 class="shop-sub">${icon(mdiCartCheck)}${this._t("shop_in_cart_title")}</h2>
+            <ul class="shop-list">${sent.map((i) => this._renderShopItem(i))}</ul>`
+        : nothing}
+      ${skipped.length
+        ? html`<div class="chips">
+            <button
+              type="button"
+              class="chip toggle"
+              aria-pressed=${this._showSkipped ? "true" : "false"}
+              @click=${() => void this._toggleSkipped()}
+            >
+              ${icon(this._showSkipped ? mdiEyeOutline : mdiEyeOffOutline)}${this._t("shop_show_skipped")} (${skipped.length})
+            </button>
+          </div>`
+        : nothing}
+      ${skipped.length && this._showSkipped
+        ? html`<h2 class="shop-sub skipped-head">${icon(mdiCancel)}${this._t("shop_never")}</h2>
+            <p class="empty-day">${this._t("shop_skipped_hint")}</p>
+            <ul class="shop-list">${skipped.map((i) => this._renderShopItem(i))}</ul>`
+        : nothing}
+    </div>`;
+  }
+
+  private async _toggleSkipped(): Promise<void> {
+    this._showSkipped = !this._showSkipped;
+    if (!this._showSkipped) return;
+    await this.updateComplete;
+    // The excluded entries sit at the end of the list: bring them into view.
+    this.renderRoot.querySelector(".skipped-head")?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+
+  private _renderShopItem(item: ShoppingItem): TemplateResult {
+    const id = item.item_id;
+    const p = item.product;
+    const busy = this._itemBusy.has(id);
+    const head = html`<div class="shop-name">
+      <span class="nm">${item.name}</span>${item.description ? html`<span class="desc">${item.description}</span>` : nothing}
+    </div>`;
+    const product = (tappable: boolean) =>
+      p
+        ? tappable
+          ? html`<button class="product" aria-label=${`${this._t("shop_other_product")}: ${p.name}`} @click=${() => this._openProduct(item)}>
+              <span class="pname">${p.name}</span><span class="pmeta">${this._productMeta(p)}</span>
+            </button>`
+          : html`<div class="product static"><span class="pname">${p.name}</span><span class="pmeta">${this._productMeta(p)}</span></div>`
+        : nothing;
+    if (item.sent_at && item.sent_uncertain)
+      return html`<li class="shop-item sent maybe" data-item=${id}>
+        <span class="lead-ico">${icon(mdiAlertCircleOutline)}</span>
+        <div class="shop-body">
+          ${head}${product(false)}
+          <p class="maybe-text" role="note">${this._t("shop_maybe")} · ${item.amount}×</p>
+          <div class="maybe-actions">
+            <button class="btn small not-in-cart" ?disabled=${busy} @click=${() => this._undo(item, false, false)}>
+              ${icon(mdiCartOutline, "i s")}<span>${this._t("shop_not_in_cart")}</span>
+            </button>
+          </div>
+        </div>
+      </li>`;
+    if (item.sent_at)
+      return html`<li class="shop-item sent" data-item=${id}>
+        <span class="lead-ico">${icon(mdiCartCheck)}</span>
+        <div class="shop-body">
+          ${head}${product(false)}
+          <div class="sent-line">
+            <span>${this._t("shop_in_cart", { when: this._formatSent(item.sent_at) })} · ${item.amount}×</span>
+          </div>
+        </div>
+        <button class="btn small undo" ?disabled=${busy} @click=${() => this._undo(item)}>
+          ${icon(mdiUndoVariant, "i s")}<span>${this._t("undo")}</span>
+        </button>
+      </li>`;
+    if (item.skip)
+      return html`<li class="shop-item skipped" data-item=${id}>
+        <span class="lead-ico">${icon(mdiCancel)}</span>
+        <div class="shop-body">${head}</div>
+        <button class="btn small take-back" @click=${() => this._setSkip(item, false)}>${this._t("shop_take_back")}</button>
+      </li>`;
+    const picked = this._isPicked(item);
+    const error = this._itemErrors.get(id);
+    return html`<li class="shop-item ${picked ? "picked" : ""} ${error ? "failed" : ""}" data-item=${id}>
+      <button
+        class="check-btn"
+        role="checkbox"
+        aria-checked=${picked ? "true" : "false"}
+        aria-label=${this._t("shop_take", { name: item.name })}
+        title=${p ? this._t("shop_take", { name: item.name }) : this._t("shop_pick_product")}
+        @click=${() => (p ? this._setPicked(id, !picked) : this._openProduct(item))}
+      >
+        <span class="check" aria-hidden="true">${picked ? icon(mdiCheck) : nothing}</span>
+      </button>
+      <div class="shop-body">
+        ${head}
+        ${p
+          ? html`<div class="prod-row">${product(true)}
+              <div class="stepper" role="group" aria-label=${`${this._t("shop_qty")}: ${item.name}`}>
+                <button class="icon-btn" aria-label=${this._t("shop_less")} ?disabled=${item.amount <= 1} @click=${() => this._setAmount(item, item.amount - 1)}>
+                  ${icon(mdiMinus)}
+                </button>
+                <output aria-live="polite">${item.amount}</output>
+                <button class="icon-btn" aria-label=${this._t("shop_more")} ?disabled=${item.amount >= AMOUNT_MAX} @click=${() => this._setAmount(item, item.amount + 1)}>
+                  ${icon(mdiPlus)}
+                </button>
+              </div></div>`
+          : html`<button class="btn pick-product" @click=${() => this._openProduct(item)}>
+              ${icon(mdiMagnify)}<span>${this._t("shop_pick_product")}</span>
+            </button>`}
+        ${error ? html`<p class="error-text item-error">${this._t("send_item_failed", { message: error })}</p>` : nothing}
+      </div>
+      <button
+        class="icon-btn item-menu"
+        aria-label=${this._t("shop_menu", { name: item.name })}
+        title=${this._t("shop_menu", { name: item.name })}
+        aria-haspopup="dialog"
+        @click=${() => (this._dialog = { kind: "item_menu", item_id: id })}
+      >
+        ${icon(mdiDotsVertical)}
+      </button>
+    </li>`;
+  }
+
+  private _renderItemMenu(d: Dialog & { kind: "item_menu" }): TemplateResult {
+    const item = this._item(d.item_id);
+    if (!item) return this._dialogFrame(html``);
+    const run = (fn: () => void) => () => {
+      this._dialog = undefined;
+      fn();
+    };
+    return this._dialogFrame(html`<div class="menu-list">
+      <button class="menu-item" @click=${() => this._openProduct(item)}>
+        ${icon(item.product ? mdiSwapHorizontal : mdiMagnify)}<span>${this._t(item.product ? "shop_other_product" : "shop_pick_product")}</span>
+      </button>
+      ${item.product
+        ? html`<button class="menu-item" @click=${run(() => void this._unmap(item))}>
+            ${icon(mdiLinkVariantOff)}<span>${this._t("shop_forget")}</span>
+          </button>`
+        : nothing}
+      <button class="menu-item" @click=${run(() => void this._setSkip(item, true))}>
+        ${icon(mdiCancel)}<span>${this._t("shop_never")}</span>
+      </button>
+    </div>`);
+  }
+
+  private _renderProductDialog(d: Dialog & { kind: "product" }): TemplateResult {
+    const item = this._item(d.item_id);
+    const searchOk = !!this._shop?.picnic.search;
+    const current = item?.product?.id;
+    let results: TemplateResult | typeof nothing = nothing;
+    if (d.state === "loading")
+      results = html`<div aria-busy="true" aria-label=${this._t("loading")}>
+        <div class="skel line"></div><div class="skel line short"></div><div class="skel line"></div>
+      </div>`;
+    else if (d.state === "error") results = html`<p class="error-text" role="alert">${this._t("product_failed", { message: d.error })}</p>`;
+    else if (d.state === "done")
+      results = d.products.length
+        ? html`<ul class="pick-list products">
+            ${d.products.map(
+              (p) => html`<li>
+                <button class="pick product-hit" aria-pressed=${p.id === current ? "true" : "false"} @click=${() => item && this._mapProduct(item, p)}>
+                  <span class="hit-text"><span class="pname">${p.name}</span><span class="pmeta">${this._productMeta(p)}</span></span>
+                  ${p.id === current ? html`<span class="chosen">${icon(mdiCheck, "i s")}${this._t("product_current")}</span>` : nothing}
+                </button>
+              </li>`,
+            )}
+          </ul>`
+        : html`<p class="empty-day">${this._t("product_none")}</p>`;
+    return this._dialogFrame(html`
+      ${searchOk
+        ? html`<p class="dlg-hint">${this._t("product_hint")}</p>`
+        : html`<div class="banner info">${icon(mdiInformationOutline)}<span>${this._t("shop_no_search")}${this._shop?.picnic.reason_code
+            ? html` ${this._t("shop_reason", { reason: picnicText(this._lang, this._shop.picnic.reason_code) })}`
+            : nothing}</span></div>`}
+      <form
+        class="search-form product-form"
+        role="search"
+        @submit=${(e: Event) => {
+          e.preventDefault();
+          void this._productSearch();
+        }}
+      >
+        <label class="field">
+          ${icon(mdiMagnify)}
+          <span class="sr">${this._t("product_search_label")}</span>
+          <input
+            type="search"
+            enterkeyhint="search"
+            autocomplete="off"
+            maxlength="60"
+            ?disabled=${!searchOk}
+            .value=${live(d.query)}
+            @input=${(e: Event) => {
+              const now = this._dialog;
+              if (now?.kind === "product") this._dialog = { ...now, query: (e.target as HTMLInputElement).value };
+            }}
+          />
+        </label>
+        <button class="btn primary" type="submit" ?disabled=${!searchOk || !d.query.trim() || d.state === "loading"}>
+          ${this._t("search_button")}
+        </button>
+      </form>
+      ${results}
+    `);
+  }
+
+  private _renderSendDialog(d: Dialog & { kind: "send" }): TemplateResult {
+    return this._dialogFrame(
+      html`<p class="send-count">${d.n === 1 ? this._t("send_text_one") : this._t("send_text", { n: d.n })}</p>
+        <p class="send-safe">${icon(mdiInformationOutline)}<span>${this._t("send_no_order")}</span></p>`,
+      html`<button class="btn" @click=${() => (this._dialog = undefined)}>${this._t("cancel")}</button>
+        <button class="btn primary send-ok" @click=${() => void this._send()}>
+          ${icon(mdiCartPlus)}<span>${this._t("send_confirm")}</span>
+        </button>`,
+    );
+  }
+
   // ---- dialogs
 
   private _dialogTitle(): string {
@@ -1786,6 +2538,12 @@ export class EatFreshPanel extends LitElement {
         return this._t("pick_title", { day: formatDay(this._lang, d.date) });
       case "week_again":
         return this._t("week_again_title");
+      case "product":
+        return this._t("product_title", { name: d.name });
+      case "item_menu":
+        return this._item(d.item_id)?.name ?? "";
+      case "send":
+        return this._t("send_title");
     }
   }
 
@@ -1813,6 +2571,12 @@ export class EatFreshPanel extends LitElement {
         return this._renderPickDialog(d);
       case "week_again":
         return this._renderWeekAgainDialog(d);
+      case "product":
+        return this._renderProductDialog(d);
+      case "item_menu":
+        return this._renderItemMenu(d);
+      case "send":
+        return this._renderSendDialog(d);
     }
   }
 

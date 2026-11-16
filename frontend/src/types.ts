@@ -129,11 +129,55 @@ export interface WsError {
   translation_placeholders?: Record<string, string>;
 }
 
-export type Tab = "search" | "collection" | "planner";
+/** A Picnic product as EatFresh shows it (`price` in cent, or null). */
+export interface PicnicProduct {
+  id: string;
+  name: string;
+  unit_quantity: string;
+  price: number | null;
+}
+
+export interface PicnicStatus {
+  available: boolean;
+  search: boolean;
+  /** English reason, only a fallback. */
+  reason: string | null;
+  /** Stable code of the reason; the panel translates it. */
+  reason_code: string | null;
+}
+
+/** One open entry of the KitchenOwl shopping list, with what EatFresh remembers. */
+export interface ShoppingItem {
+  item_id: number;
+  name: string;
+  description: string;
+  product: PicnicProduct | null;
+  amount: number;
+  skip: boolean;
+  /** When the product went to the Picnic cart (ISO time), or null. */
+  sent_at: string | null;
+  /** Picnic did not answer in time: it may or may not be in the cart. */
+  sent_uncertain?: boolean;
+}
+
+/** Answer of `eatfresh/shopping` (reads KitchenOwl and the store, never Picnic). */
+export interface ShoppingResponse {
+  picnic: PicnicStatus;
+  items: ShoppingItem[];
+}
+
+export interface PicnicSendResponse {
+  sent: { item_id: number; product_id: string; amount: number }[];
+  /** `code` is translated by the panel; `message` is English, only a fallback. */
+  failed: { item_id: number; code?: string; message: string }[];
+}
+
+export type Tab = "search" | "collection" | "planner" | "shopping";
 
 export type View =
   | { name: "search" }
   | { name: "collection" }
   | { name: "planner" }
+  | { name: "shopping" }
   | { name: "recipe"; key?: string; url?: string }
   | { name: "korecipe"; id: number };

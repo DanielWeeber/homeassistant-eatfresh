@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Iterable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import logging
 import time
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -15,7 +15,11 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CACHE_MAX_ENTRIES,
+    MAX_PICNIC_MAP,
+    MAX_PICNIC_SENT,
+    MAX_PICNIC_SKIP,
     MAX_WEEK_LISTS,
+    PICNIC_SENT_MAX_AGE,
     STORAGE_KEY,
     STORAGE_MINOR_VERSION,
     STORAGE_SAVE_DELAY,
@@ -49,12 +53,45 @@ class _EatFreshStore(Store[dict[str, Any]]):
     ) -> dict[str, Any]:
         """Keep everything and add what newer versions expect.
 
-        1.1 (EatFresh 0.1.0) had only favorites; 1.2 adds hidden recipes.
+        1.1 (EatFresh 0.1.0) had only favorites; 1.2 adds hidden recipes;
+        1.3 (EatFresh 0.4.0) adds the Picnic parts.
         """
         data = dict(old_data or {})
         if old_major_version == 1 and old_minor_version < 2:
             data.setdefault("hidden", {})
+        if old_major_version == 1 and old_minor_version < 3:
+            data.setdefault("picnic_map", {})
+            data.setdefault("picnic_skip", [])
+            data.setdefault("picnic_sent", {})
         return data
+
+
+class PicnicProduct(TypedDict):
+    """The Picnic product remembered for an ingredient."""
+
+    product_id: str
+    name: str
+    unit_quantity: str | None
+    price: int | None
+    amount: int | None
+
+
+class PicnicSent(TypedDict):
+    """What EatFresh put into the Picnic cart for a shopping list entry.
+
+    ``uncertain`` is True when Picnic did not answer in time: the product
+    may or may not be in the cart, and it is not sent again by itself.
+    """
+
+    product_id: str
+    amount: int
+    at: str
+    uncertain: NotRequired[bool]
+
+
+def picnic_key(name: str) -> str:
+    """Return the key of an ingredient: lower case, single spaces."""
+    return " ".join(str(name).split()).lower()
 
 
 class FavoritesStore:
@@ -78,6 +115,9 @@ class FavoritesStore:
         self._hidden: dict[str, str] = {}
         self._week_lists: dict[str, str] = {}
         self._week_list_done: dict[str, list[str]] = {}
+        self._picnic_map: dict[str, PicnicProduct] = {}
+        self._picnic_skip: list[str] = []
+        self._picnic_sent: dict[str, PicnicSent] = {}
 
     async def async_load(self) -> None:
         """Load the favorites and hidden recipes from disk.
@@ -111,6 +151,27 @@ class FavoritesStore:
             for key, value in week_list_done.items()
             if key in self._week_lists and isinstance(value, list)
         }
+        self._picnic_map = {}
+        for key, value in _section(data, "picnic_map").items():
+            if (product := _picnic_product(value)) is not None and picnic_key(key):
+                self._picnic_map[picnic_key(key)] = product
+        self._picnic_map = dict(list(self._picnic_map.items())[-MAX_PICNIC_MAP:])
+        skip = data.get("picnic_skip")
+        if skip is not None and not isinstance(skip, list):
+            _LOGGER.warning("Ignoring picnic_skip in the EatFresh store: not a list")
+            skip = []
+        self._picnic_skip = list(
+            dict.fromkeys(
+                picnic_key(name)
+                for name in skip or ()
+                if isinstance(name, str) and picnic_key(name)
+            )
+        )[-MAX_PICNIC_SKIP:]
+        self._picnic_sent = {
+            str(key): sent
+            for key, value in _section(data, "picnic_sent").items()
+            if str(key).isdigit() and (sent := _picnic_sent(value)) is not None
+        }
 
     @callback
     def _data_to_save(self) -> dict[str, Any]:
@@ -122,7 +183,19 @@ class FavoritesStore:
             "week_list_done": {
                 key: list(value) for key, value in self._week_list_done.items()
             },
+            "picnic_map": {key: dict(value) for key, value in self._picnic_map.items()},
+            "picnic_skip": list(self._picnic_skip),
+            "picnic_sent": {
+                key: dict(value) for key, value in self._picnic_sent.items()
+            },
         }
+
+    async def async_save_now(self) -> None:
+        """Write everything to disk now (marks of the Picnic cart).
+
+        A pending delayed write is replaced by this one.
+        """
+        await self._store.async_save(self._data_to_save())
 
     @callback
     def _schedule_save(self) -> None:
@@ -277,6 +350,171 @@ class FavoritesStore:
             self._week_list_done.pop(old, None)
         self._schedule_save()
         return when
+
+    # ----- Picnic -------------------------------------------------------
+
+    @callback
+    def picnic_product(self, name: str) -> PicnicProduct | None:
+        """Return the Picnic product remembered for an ingredient or None."""
+        return self._picnic_map.get(picnic_key(name))
+
+    @callback
+    def async_set_picnic_product(
+        self,
+        name: str,
+        *,
+        product_id: str,
+        product_name: str,
+        unit_quantity: str | None,
+        price: int | None,
+        amount: int | None,
+    ) -> None:
+        """Remember the Picnic product of an ingredient (the newest last)."""
+        key = picnic_key(name)
+        self._picnic_map.pop(key, None)
+        self._picnic_map[key] = {
+            "product_id": product_id,
+            "name": product_name,
+            "unit_quantity": unit_quantity,
+            "price": price,
+            "amount": amount,
+        }
+        while len(self._picnic_map) > MAX_PICNIC_MAP:
+            del self._picnic_map[next(iter(self._picnic_map))]
+        self._schedule_save()
+
+    @callback
+    def async_remove_picnic_product(self, name: str) -> bool:
+        """Forget the Picnic product of an ingredient. True if there was one."""
+        if self._picnic_map.pop(picnic_key(name), None) is None:
+            return False
+        self._schedule_save()
+        return True
+
+    @callback
+    def is_picnic_skipped(self, name: str) -> bool:
+        """Return True if an ingredient is never bought at Picnic."""
+        return picnic_key(name) in self._picnic_skip
+
+    @callback
+    def async_set_picnic_skip(self, name: str, skip: bool) -> None:
+        """Exclude an ingredient from Picnic, or take it back in."""
+        key = picnic_key(name)
+        if (key in self._picnic_skip) == skip:
+            return
+        if skip:
+            self._picnic_skip.append(key)
+            del self._picnic_skip[:-MAX_PICNIC_SKIP]
+        else:
+            self._picnic_skip.remove(key)
+        self._schedule_save()
+
+    @callback
+    def picnic_sent(self, item_id: int) -> PicnicSent | None:
+        """Return what was put into the cart for a list entry, or None."""
+        return self._picnic_sent.get(str(int(item_id)))
+
+    @callback
+    def async_set_picnic_sent(
+        self, item_id: int, product_id: str, amount: int, uncertain: bool = False
+    ) -> str:
+        """Mark a list entry as put into the cart now; return the time.
+
+        ``uncertain``: Picnic did not answer in time, so it may be there.
+        """
+        when = dt_util.utcnow().isoformat()
+        key = str(int(item_id))
+        self._picnic_sent.pop(key, None)
+        mark: PicnicSent = {
+            "product_id": product_id,
+            "amount": int(amount),
+            "at": when,
+        }
+        if uncertain:
+            mark["uncertain"] = True
+        self._picnic_sent[key] = mark
+        while len(self._picnic_sent) > MAX_PICNIC_SENT:
+            del self._picnic_sent[next(iter(self._picnic_sent))]
+        self._schedule_save()
+        return when
+
+    @callback
+    def async_remove_picnic_sent(self, item_id: int) -> bool:
+        """Remove the mark of a list entry. True if there was one."""
+        if self._picnic_sent.pop(str(int(item_id)), None) is None:
+            return False
+        self._schedule_save()
+        return True
+
+    @callback
+    def async_prune_picnic_sent(self, on_list: Iterable[int]) -> None:
+        """Drop marks older than 14 days or of entries no longer on the list."""
+        keep = {str(int(item_id)) for item_id in on_list}
+        oldest = dt_util.utcnow() - PICNIC_SENT_MAX_AGE
+        gone = [
+            key
+            for key, sent in self._picnic_sent.items()
+            if key not in keep or _older_than(sent["at"], oldest)
+        ]
+        for key in gone:
+            del self._picnic_sent[key]
+        if gone:
+            self._schedule_save()
+
+
+def _older_than(value: str, limit: datetime) -> bool:
+    """Return True if an ISO time is before ``limit`` (or unreadable)."""
+    when = dt_util.parse_datetime(value)
+    if when is None:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt_util.UTC)
+    return when < limit
+
+
+def _picnic_product(value: Any) -> PicnicProduct | None:
+    """Return a stored Picnic product if it has the right shape."""
+    if not isinstance(value, dict):
+        return None
+    product_id = value.get("product_id")
+    name = value.get("name")
+    if not isinstance(product_id, str) or not product_id:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    unit = value.get("unit_quantity")
+    price = value.get("price")
+    amount = value.get("amount")
+    return {
+        "product_id": product_id,
+        "name": name,
+        "unit_quantity": unit if isinstance(unit, str) else None,
+        "price": price
+        if isinstance(price, int) and not isinstance(price, bool) and price >= 0
+        else None,
+        "amount": amount
+        if isinstance(amount, int) and not isinstance(amount, bool) and amount >= 1
+        else None,
+    }
+
+
+def _picnic_sent(value: Any) -> PicnicSent | None:
+    """Return a stored cart mark if it has the right shape."""
+    if not isinstance(value, dict):
+        return None
+    product_id = value.get("product_id")
+    amount = value.get("amount")
+    at = value.get("at")
+    if not isinstance(product_id, str) or not product_id:
+        return None
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+        return None
+    if not isinstance(at, str) or dt_util.parse_datetime(at) is None:
+        return None
+    mark: PicnicSent = {"product_id": product_id, "amount": amount, "at": at}
+    if value.get("uncertain") is True:
+        mark["uncertain"] = True
+    return mark
 
 
 def _section(data: dict[str, Any], name: str) -> dict[Any, Any]:

@@ -166,7 +166,7 @@ async def test_store_upgrades_file_of_version_0_1_0(
     await hass.async_block_till_done()
     saved = hass_storage[STORAGE_KEY]
     assert saved["version"] == 1
-    assert saved["minor_version"] == 2
+    assert saved["minor_version"] == 3
     assert saved["data"]["favorites"] == {"fakea:r1": favorite}
     assert list(saved["data"]["hidden"]) == ["12"]
 

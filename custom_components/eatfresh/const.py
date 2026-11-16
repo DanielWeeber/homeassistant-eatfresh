@@ -7,7 +7,7 @@ from typing import Final
 
 DOMAIN: Final = "eatfresh"
 NAME: Final = "EatFresh"
-VERSION: Final = "0.3.0"
+VERSION: Final = "0.4.0"
 
 REPOSITORY_URL: Final = "https://github.com/DanielWeeber/homeassistant-eatfresh"
 USER_AGENT: Final = f"EatFresh/{VERSION} (+{REPOSITORY_URL})"
@@ -31,7 +31,8 @@ JSONLD: Final = "jsonld"
 # Persistent storage
 STORAGE_VERSION: Final = 1
 # 1.1: EatFresh 0.1.0 (favorites). 1.2: EatFresh 0.2.0 adds hidden recipes.
-STORAGE_MINOR_VERSION: Final = 2
+# 1.3: EatFresh 0.4.0 adds picnic_map, picnic_skip and picnic_sent.
+STORAGE_MINOR_VERSION: Final = 3
 STORAGE_KEY: Final = "eatfresh.favorites"
 STORAGE_SAVE_DELAY: Final = 2
 
@@ -98,6 +99,7 @@ ATTR_DAYS: Final = "days"
 ATTR_DATE: Final = "date"
 MAX_QUERY_LENGTH: Final = 100
 ATTR_LIMIT: Final = "limit"
+ATTR_NAME_ONLY: Final = "name_only"
 DEFAULT_COLLECTION_LIMIT: Final = 50
 MAX_COLLECTION_LIMIT: Final = 200
 
@@ -108,3 +110,19 @@ ERR_NOT_FOUND: Final = "not_found"
 ERR_KITCHENOWL_ERROR: Final = "kitchenowl_error"
 ERR_KITCHENOWL_AUTH: Final = "kitchenowl_auth"
 ERR_NOT_LOADED: Final = "not_loaded"
+ERR_PICNIC_UNAVAILABLE: Final = "picnic_unavailable"
+ERR_PICNIC_ERROR: Final = "picnic_error"
+
+# Picnic
+# Ingredients with a remembered product, excluded ingredients and marks of
+# entries put into the cart kept at most.
+MAX_PICNIC_MAP: Final = 500
+MAX_PICNIC_SKIP: Final = 500
+MAX_PICNIC_SENT: Final = 300
+# Marks of entries put into the cart are dropped after this.
+PICNIC_SENT_MAX_AGE: Final = timedelta(days=14)
+MAX_PICNIC_NAME_LENGTH: Final = 100
+MAX_PICNIC_QUERY_LENGTH: Final = 60
+MAX_PICNIC_SEND_ITEMS: Final = 60
+MAX_PICNIC_AMOUNT: Final = 20
+PICNIC_SEARCH_LIMIT: Final = 8

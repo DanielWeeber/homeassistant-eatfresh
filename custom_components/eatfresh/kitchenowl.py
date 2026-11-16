@@ -503,6 +503,40 @@ class KitchenOwlClient:
         data = self._expect(await self._request("GET", path), list, path)
         return [{"id": item["id"], "name": item.get("name", "")} for item in data]
 
+    async def list_shoppinglist_items(self, shoppinglist_id: int) -> list[dict]:
+        """Return the open entries of a list as ``[{id, name, description}]``.
+
+        Read only: nothing on the list is changed or removed. Uses
+        ``GET /api/shoppinglist/<id>/items`` (KitchenOwl 0.8.1). KitchenOwl
+        keeps no "checked" state on the server: an entry that is bought is
+        taken off the list, so every row it returns is open. The order is the
+        one of the server (by name). ``description`` is the amount text and
+        is ``""`` when there is none. Rows without an id or a name are
+        skipped.
+        """
+        path = f"/api/shoppinglist/{int(shoppinglist_id)}/items"
+        data = self._expect(await self._request("GET", path), list, path)
+        items: list[dict] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            try:
+                item_id = int(row["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            description = row.get("description")
+            items.append(
+                {
+                    "id": item_id,
+                    "name": name,
+                    "description": description if isinstance(description, str) else "",
+                }
+            )
+        return items
+
     async def list_recipes(self, household_id: int) -> list[dict]:
         """Return all recipes of a household, reduced to the fields we use.
 

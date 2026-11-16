@@ -1,6 +1,6 @@
 [project]
 name = "homeassistant-eatfresh"
-version = "0.3.0"
+version = "0.4.0"
 description = "EatFresh: find recipes and save them in KitchenOwl from Home Assistant."
 requires-python = ">=3.14"
 
