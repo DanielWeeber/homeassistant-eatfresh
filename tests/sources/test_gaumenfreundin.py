@@ -95,15 +95,17 @@ async def test_get(source: GaumenfreundinSource, mock: aioresponses) -> None:
     assert recipe.steps[0] == "Kürbis würfeln und die Zwiebel hacken."
     assert len(recipe.steps) == 3
     by_name = {ingredient.name: ingredient for ingredient in recipe.ingredients}
-    assert len(recipe.ingredients) == 9
+    assert len(recipe.ingredients) == 10
     assert (by_name["Zwiebel"].amount, by_name["Zwiebel"].unit) == (0.5, None)
     assert (by_name["Olivenöl"].amount, by_name["Olivenöl"].unit) == (2.0, "EL")
     assert (by_name["Currypulver"].amount, by_name["Currypulver"].unit) == (1.5, "TL")
     assert by_name["Knoblauch"].unit == "Zehe"
     assert by_name["Muskat"].note == "frisch gerieben"
     assert by_name["Muskat"].raw == "1 Prise Muskat, frisch gerieben"
-    assert by_name["Salz und Pfeffer"].amount is None
-    assert by_name["Salz und Pfeffer"].unit is None
+    # "Salz und Pfeffer" without an amount is read as two ingredients (0.4.1).
+    assert "Salz und Pfeffer" not in by_name
+    assert by_name["Salz"].amount is None
+    assert by_name["Pfeffer"].unit is None
 
 
 async def test_get_cleans_plural_notation_in_units(

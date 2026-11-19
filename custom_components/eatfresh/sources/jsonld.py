@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..errors import RecipeNotFound
-from ..ingredients import parse_ingredient
+from ..ingredients import finish_ingredients, parse_ingredient
 from ..kitchenowl import normalize_source
 from ..models import Ingredient, Recipe, SearchHit
 from .base import RecipeSource, first_int, host_of, html_to_text
@@ -305,7 +305,7 @@ def _ingredients(node: dict[str, Any]) -> list[Ingredient]:
             ingredient = parse_ingredient(line)
             if ingredient.name:
                 result.append(ingredient)
-    return result
+    return finish_ingredients(result)
 
 
 def recipe_from_node(

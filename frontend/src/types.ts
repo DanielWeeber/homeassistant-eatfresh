@@ -77,6 +77,8 @@ export interface CollectionRecipe {
   yields: number | null;
   tags: string[];
   hidden: boolean;
+  /** Number of ingredients missing in KitchenOwl (EatFresh remembers them). Absent on older integrations. */
+  missing?: number;
 }
 
 /** Answer of `eatfresh/collection/recipe` (read from KitchenOwl only). */
@@ -85,6 +87,20 @@ export interface CollectionRecipeResponse {
   kitchenowl_id: number;
   tags: string[];
   hidden: boolean;
+  /** Names of ingredients that are gone from KitchenOwl; `recipe.ingredients` still has them. Absent on older integrations. */
+  missing?: string[];
+}
+
+/** Answer of `eatfresh/collection/restore`: names written back, and names still missing afterwards. */
+export interface CollectionRestoreResponse {
+  restored: string[];
+  missing: string[];
+}
+
+/** Answer of `eatfresh/collection/forget`: names EatFresh forgot, and names still missing afterwards. */
+export interface CollectionForgetResponse {
+  removed: string[];
+  missing: string[];
 }
 
 export interface TagsResponse {

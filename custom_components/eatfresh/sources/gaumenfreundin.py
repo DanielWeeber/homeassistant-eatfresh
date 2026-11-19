@@ -11,7 +11,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..errors import RecipeNotFound, SourceError
-from ..ingredients import clean_name, format_amount, normalize_unit, parse_amount
+from ..ingredients import (
+    clean_name,
+    finish_ingredients,
+    format_amount,
+    normalize_unit,
+    parse_amount,
+)
 from ..models import Ingredient, Recipe, SearchHit
 from .base import (
     RecipeSource,
@@ -156,12 +162,16 @@ class GaumenfreundinSource(RecipeSource):
             for entry in entries if isinstance(entries, list) else []:
                 if not isinstance(entry, dict):
                     continue
-                name = clean_name(html_to_text(entry.get("name")))
-                if not name:
-                    continue
                 amount_text = html_to_text(entry.get("amount"))
                 amount = parse_amount(amount_text)
                 unit = normalize_unit(html_to_text(entry.get("unit")))
+                name = clean_name(
+                    html_to_text(entry.get("name")),
+                    amount,
+                    unit if amount is not None else None,
+                )
+                if not name:
+                    continue
                 notes = [html_to_text(entry.get("notes"))]
                 if amount is None and amount_text:
                     notes.insert(0, amount_text)
@@ -180,7 +190,7 @@ class GaumenfreundinSource(RecipeSource):
                         raw=raw,
                     )
                 )
-        return result
+        return finish_ingredients(result)
 
     @staticmethod
     def _steps(recipe: dict[str, Any]) -> list[str]:

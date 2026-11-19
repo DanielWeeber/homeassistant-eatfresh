@@ -35,10 +35,10 @@ from .const import (
 )
 from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, RecipeNotFound
 from .http import UnsafeAddress, check_public_url, host_matches, split_url
-from .kitchenowl import normalize_source
-from .models import Recipe, SearchHit, split_key
+from .kitchenowl import ingredient_key, item_rows, merge_items, normalize_source
+from .models import Ingredient, Recipe, SearchHit, split_key
 from .picnic_amount import suggest_amount
-from .store import Favorite, FavoritesStore, TTLCache
+from .store import Favorite, FavoritesStore, RememberedItem, TTLCache
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -264,6 +264,18 @@ class EatFreshData:
     _planner_fetch: asyncio.Task[list[dict[str, Any]]] | None = None
     # One transfer to (or undo in) the Picnic cart at a time.
     _picnic_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # One restore of remembered ingredients at a time (button or transfer),
+    # so each one reads what the one before it wrote.
+    _restore_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def __post_init__(self) -> None:
+        """Let the memory of ingredients learn from KitchenOwl's answers.
+
+        Every recipe list and every full recipe the client gets anyway is
+        passed on; no extra request is sent for the memory.
+        """
+        self.client.on_recipe_list = self._learn_recipe_list
+        self.client.on_recipe = self._learn_recipe
 
     # ----- images -------------------------------------------------------
 
@@ -490,6 +502,13 @@ class EatFreshData:
             )
             kitchenowl_id = await self.client.create_recipe(self.household_id, to_create)
             created = True
+            # Remember the sent ingredients at once (ids follow on the next
+            # read). They replace any memory of a deleted recipe with this id.
+            self.store.async_start_ingredients(
+                kitchenowl_id,
+                kitchenowl_module.created_item_rows(to_create.ingredients),
+                created_at=self.client.created_at_of(kitchenowl_id),
+            )
         self.store.async_unhide(kitchenowl_id)
         self.store.async_set(
             recipe.key,
@@ -584,21 +603,160 @@ class EatFreshData:
             if not self.store.is_hidden(favorite["kitchenowl_id"])
         ]
 
+    # ----- remembered ingredients ---------------------------------------
+
+    @callback
+    def _learn_recipe_list(self, household_id: int, recipes: list[dict]) -> None:
+        """Learn the items of a fresh recipe list; forget long gone recipes.
+
+        Only lists of the own household count. A recipe without
+        ``item_rows`` is kept as it is. A recipe missing from the list is
+        forgotten only after 30 days, never because of an empty list (see
+        :meth:`FavoritesStore.async_prune_ingredients`).
+        """
+        if household_id != self.household_id:
+            return
+        keep: set[int] = set()
+        for recipe in recipes:
+            try:
+                kitchenowl_id = int(recipe["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            keep.add(kitchenowl_id)
+            rows = recipe.get("item_rows")
+            if isinstance(rows, list):
+                self.store.async_learn_ingredients(
+                    kitchenowl_id, rows, recipe.get("created_at")
+                )
+        self.store.async_prune_ingredients(keep)
+
+    @callback
+    def _learn_recipe(self, data: Mapping[str, Any]) -> list[RememberedItem]:
+        """Learn the items of a full recipe; return the missing ones.
+
+        A recipe of another household or without an item list is ignored.
+        """
+        household = data.get("household_id")
+        if household is not None and household != self.household_id:
+            return []
+        items = data.get("items")
+        if not isinstance(items, list):
+            return []
+        try:
+            kitchenowl_id = int(data["id"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        return self.store.async_learn_ingredients(
+            kitchenowl_id, item_rows(items), data.get("created_at")
+        )
+
+    @callback
+    def _missing_of(self, recipe: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Return the remembered items missing in a recipe of the list."""
+        rows = recipe.get("item_rows")
+        try:
+            memory = self.store.recipe_ingredients(int(recipe["id"]))
+        except (KeyError, TypeError, ValueError):
+            return []
+        if not memory or not isinstance(rows, list):
+            return []
+        return merge_items(memory, rows)[1]
+
+    async def async_restore_ingredients(
+        self, kitchenowl_id: int
+    ) -> dict[str, list[str]]:
+        """Add the remembered ingredients missing in KitchenOwl back to it.
+
+        Return ``{restored, missing}``: the names added and the names still
+        missing after the write (normally none). Nothing is removed.
+        """
+        await self.async_require_own([kitchenowl_id])
+        async with self._restore_lock:
+            memory = self.store.recipe_ingredients(kitchenowl_id)
+            if not memory:
+                return {"restored": [], "missing": []}
+            result = await self.client.restore_recipe_items(kitchenowl_id, memory)
+        return {
+            "restored": list(result.get("restored") or []),
+            "missing": list(result.get("missing") or []),
+        }
+
+    async def async_forget_ingredients(
+        self, kitchenowl_id: int, names: Iterable[str] | None = None
+    ) -> dict[str, list[str]]:
+        """Forget remembered ingredients that are missing in KitchenOwl.
+
+        Only missing ones are forgotten: those named in ``names`` (any case),
+        or all without ``names``. The recipe is read once to know what is
+        missing now. KitchenOwl is not changed. Return ``{removed, missing}``
+        (the names forgotten and the ones still missing).
+        """
+        await self.async_require_own([kitchenowl_id])
+        data = await self.client.get_recipe(kitchenowl_id)
+        household = data.get("household_id")
+        if household is not None and household != self.household_id:
+            raise RecipeNotFound("The recipe belongs to another household")
+        missing = self._learn_recipe(data)
+        wanted = None if names is None else {ingredient_key(name) for name in names}
+        gone = {
+            ingredient_key(row["name"])
+            for row in missing
+            if wanted is None or ingredient_key(row["name"]) in wanted
+        }
+        removed = [
+            row["name"] for row in missing if ingredient_key(row["name"]) in gone
+        ]
+        if removed:
+            memory = self.store.recipe_ingredients(kitchenowl_id) or []
+            self.store.async_set_ingredients(
+                kitchenowl_id,
+                [
+                    row
+                    for row in memory
+                    if row["id"] is not None or ingredient_key(row["name"]) not in gone
+                ],
+            )
+        return {
+            "removed": removed,
+            "missing": [
+                row["name"]
+                for row in missing
+                if ingredient_key(row["name"]) not in gone
+            ],
+        }
+
     # ----- KitchenOwl ---------------------------------------------------
 
     async def async_collection(self, include_hidden: bool = False) -> list[dict[str, Any]]:
         """Return the recipes stored in KitchenOwl.
 
-        Each recipe gets ``hidden``. Hidden recipes are left out unless
-        ``include_hidden`` is set.
+        Each recipe gets ``hidden`` and ``missing`` (the number of remembered
+        ingredients that are no longer in KitchenOwl); their names are added
+        to ``items``, so the search finds them. Hidden recipes are left out
+        unless ``include_hidden`` is set.
         """
         recipes = []
-        for recipe in await self.client.list_recipes(self.household_id):
+        listed = await self.client.list_recipes(self.household_id)
+        # Also learned by the client's listener; repeated here so the result
+        # never depends on it. Learning the same list twice changes nothing.
+        self._learn_recipe_list(self.household_id, listed)
+        for recipe in listed:
             hidden = self.store.is_hidden(recipe.get("id"))
             if hidden and not include_hidden:
                 continue
             tags = self.localize_tags(recipe.get("tags") or [])
-            recipes.append({**recipe, "tags": tags, "hidden": hidden})
+            missing = self._missing_of(recipe)
+            items = list(recipe.get("items") or [])
+            items.extend(row["name"] for row in missing)
+            recipes.append(
+                {
+                    **recipe,
+                    "items": items,
+                    "tags": tags,
+                    "hidden": hidden,
+                    "missing": len(missing),
+                }
+            )
         return recipes
 
     async def async_search_collection(
@@ -661,13 +819,38 @@ class EatFreshData:
         ], total
 
     async def async_collection_recipe(self, kitchenowl_id: int) -> Recipe:
-        """Return a recipe as stored in KitchenOwl. No recipe page is fetched."""
+        """Return a recipe as stored in KitchenOwl. No recipe page is fetched.
+
+        The ingredients include the remembered ones missing in KitchenOwl.
+        """
+        return (await self.async_collection_recipe_missing(kitchenowl_id))[0]
+
+    async def async_collection_recipe_missing(
+        self, kitchenowl_id: int
+    ) -> tuple[Recipe, list[str]]:
+        """Return a recipe of the collection and the names missing in KitchenOwl.
+
+        The ingredients are complete, in the remembered order: an ingredient
+        missing in KitchenOwl is built from its remembered name and amount
+        text.
+        """
         await self.async_require_own([kitchenowl_id])
         data = await self.client.get_recipe(kitchenowl_id)
         household = data.get("household_id")
         if household is not None and household != self.household_id:
             raise RecipeNotFound("The recipe belongs to another household")
-        return kitchenowl_module.recipe_to_model(data)
+        missing = self._learn_recipe(data)
+        recipe = kitchenowl_module.recipe_to_model(data)
+        if not missing:
+            return recipe, []
+        memory = self.store.recipe_ingredients(kitchenowl_id) or []
+        ingredients = []
+        for row in memory:
+            note = " ".join(row["description"].split())
+            raw = f"{note} {row['name']}" if note else row["name"]
+            ingredients.append(Ingredient(name=row["name"], raw=raw))
+        names = [row["name"] for row in missing]
+        return replace(recipe, ingredients=ingredients), names
 
     async def async_hide(self, kitchenowl_id: int) -> None:
         """Hide a recipe of the collection. KitchenOwl stays unchanged.
@@ -845,22 +1028,45 @@ class EatFreshData:
     async def async_add_to_shopping_list(self, recipe_ids: list[int]) -> int:
         """Put the ingredients of KitchenOwl recipes on the shopping list.
 
-        The recipes are sent one after the other, in the given order. If one
-        fails after others went through, ``ShoppingListPartial`` says how many
-        are already on the list, so a second try can leave them out.
+        The recipes are sent one after the other, in the given order. Before
+        a recipe goes, remembered ingredients missing in KitchenOwl are added
+        back to it; if that fails, the recipe fails. If one fails after
+        others went through, ``ShoppingListPartial`` says how many are
+        already on the list, so a second try can leave them out.
         """
         await self.async_require_own(recipe_ids)
         added = 0
         for done, recipe_id in enumerate(recipe_ids):
             try:
-                added += await self.client.add_recipe_to_shoppinglist(
-                    self.shoppinglist_id, recipe_id
-                )
+                added += await self._async_add_recipe_to_list(recipe_id)
             except EatFreshError as err:
                 if done == 0:
                     raise
                 raise ShoppingListPartial(err, done, len(recipe_ids), added) from err
         return added
+
+    async def _async_add_recipe_to_list(self, recipe_id: int) -> int:
+        """Restore missing ingredients of a recipe, then put it on the list."""
+        if not self.store.recipe_ingredients(recipe_id):
+            return await self.client.add_recipe_to_shoppinglist(
+                self.shoppinglist_id, recipe_id
+            )
+        async with self._restore_lock:
+            memory = self.store.recipe_ingredients(recipe_id) or []
+            result = await self.client.restore_recipe_items(recipe_id, memory)
+        if result.get("missing"):
+            raise KitchenOwlError(
+                "KitchenOwl did not take back the ingredients: "
+                + ", ".join(result["missing"])
+            )
+        recipe = result.get("recipe")
+        if isinstance(recipe, dict):
+            return await self.client.add_recipe_to_shoppinglist(
+                self.shoppinglist_id, recipe_id, recipe=recipe
+            )
+        return await self.client.add_recipe_to_shoppinglist(
+            self.shoppinglist_id, recipe_id
+        )
 
     # ----- Picnic -------------------------------------------------------
 

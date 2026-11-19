@@ -44,6 +44,7 @@ from .errors import (
     SourceError,
 )
 from .image_proxy import sign_image_url, sign_photo
+from .kitchenowl import MAX_ITEM_NAME
 from . import picnic
 from .runtime import (
     EatFreshData,
@@ -58,6 +59,10 @@ from .runtime import (
 _LOGGER = logging.getLogger(__name__)
 
 KITCHENOWL_ID = vol.All(vol.Coerce(int), vol.Range(min=1))
+# Names of remembered ingredients (KitchenOwl allows 128 characters).
+INGREDIENT_NAMES = vol.All(
+    [vol.All(str, vol.Length(min=1, max=MAX_ITEM_NAME))], vol.Length(max=200)
+)
 
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -178,6 +183,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_collection_hide,
         ws_collection_unhide,
         ws_collection_set_tags,
+        ws_collection_restore,
+        ws_collection_forget,
         ws_tags,
         ws_shopping_list_add,
         ws_planner,
@@ -370,7 +377,11 @@ async def ws_collection(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Return the recipes stored in KitchenOwl (hidden ones only on request)."""
+    """Return the recipes stored in KitchenOwl (hidden ones only on request).
+
+    ``missing`` is the number of remembered ingredients a recipe no longer
+    has in KitchenOwl.
+    """
     recipes = [
         {
             "kitchenowl_id": recipe["id"],
@@ -381,6 +392,7 @@ async def ws_collection(
             "yields": recipe.get("yields"),
             "tags": list(recipe.get("tags") or []),
             "hidden": recipe["hidden"],
+            "missing": recipe.get("missing", 0),
         }
         for recipe in await data.async_collection(msg["include_hidden"])
     ]
@@ -401,9 +413,13 @@ async def ws_collection_recipe(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Return a recipe as stored in KitchenOwl, without loading its web page."""
+    """Return a recipe as stored in KitchenOwl, without loading its web page.
+
+    The ingredients include the remembered ones missing in KitchenOwl;
+    ``missing`` lists their names.
+    """
     kitchenowl_id = msg["kitchenowl_id"]
-    recipe = await data.async_collection_recipe(kitchenowl_id)
+    recipe, missing = await data.async_collection_recipe_missing(kitchenowl_id)
     item = recipe.as_dict()
     item["image"] = sign_photo(hass, recipe.image)
     connection.send_result(
@@ -413,6 +429,7 @@ async def ws_collection_recipe(
             "kitchenowl_id": kitchenowl_id,
             "tags": data.localize_tags(recipe.tags),
             "hidden": data.store.is_hidden(kitchenowl_id),
+            "missing": missing,
         },
     )
 
@@ -476,6 +493,59 @@ async def ws_collection_set_tags(
     """Replace the tags (categories) of a KitchenOwl recipe."""
     tags = await data.async_set_tags(msg["kitchenowl_id"], msg["tags"])
     connection.send_result(msg["id"], {"tags": tags})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/restore",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_restore(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Add the remembered ingredients missing in KitchenOwl back to a recipe.
+
+    Only adds: every ingredient the recipe has stays. ``missing`` lists the
+    names still missing after the write (normally none).
+    """
+    result = await data.async_restore_ingredients(msg["kitchenowl_id"])
+    connection.send_result(
+        msg["id"], {"restored": result["restored"], "missing": result["missing"]}
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/collection/forget",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Optional("names"): INGREDIENT_NAMES,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_collection_forget(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Forget remembered ingredients that are missing in KitchenOwl.
+
+    Without ``names`` all missing ones are forgotten. KitchenOwl stays
+    unchanged.
+    """
+    result = await data.async_forget_ingredients(
+        msg["kitchenowl_id"], msg.get("names")
+    )
+    connection.send_result(
+        msg["id"], {"removed": result["removed"], "missing": result["missing"]}
+    )
 
 
 @websocket_api.websocket_command({vol.Required("type"): "eatfresh/tags"})

@@ -218,6 +218,14 @@ export const panelStyles = css`
   .banner.info { background: var(--ef-tint); }
   .banner.info svg.i { color: var(--ef-primary); }
   .error-text { color: var(--ef-error); }
+  .panel-box > .miss-notice { margin: 0 0 8px; }
+  .miss-body { flex: 1; min-width: 0; }
+  .miss-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .miss-actions .btn { flex: 1 1 auto; white-space: normal; text-align: center; }
+  .banner.info .miss-actions .btn svg.i { color: inherit; margin-top: 0; }
+  .ingredients li.missing { color: var(--ef-text2); }
+  .ingredients .miss-mark { display: inline-flex; vertical-align: text-bottom; margin-left: 6px; color: var(--ef-text2); }
+  .ingredients .miss-mark svg.i { width: 16px; height: 16px; }
 
   /* Recipe cards */
   .grid {

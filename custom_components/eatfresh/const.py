@@ -7,7 +7,7 @@ from typing import Final
 
 DOMAIN: Final = "eatfresh"
 NAME: Final = "EatFresh"
-VERSION: Final = "0.4.0"
+VERSION: Final = "0.4.1"
 
 REPOSITORY_URL: Final = "https://github.com/DanielWeeber/homeassistant-eatfresh"
 USER_AGENT: Final = f"EatFresh/{VERSION} (+{REPOSITORY_URL})"
@@ -32,7 +32,8 @@ JSONLD: Final = "jsonld"
 STORAGE_VERSION: Final = 1
 # 1.1: EatFresh 0.1.0 (favorites). 1.2: EatFresh 0.2.0 adds hidden recipes.
 # 1.3: EatFresh 0.4.0 adds picnic_map, picnic_skip and picnic_sent.
-STORAGE_MINOR_VERSION: Final = 3
+# 1.4: EatFresh 0.4.1 adds ingredients (remembered items of the recipes).
+STORAGE_MINOR_VERSION: Final = 4
 STORAGE_KEY: Final = "eatfresh.favorites"
 STORAGE_SAVE_DELAY: Final = 2
 

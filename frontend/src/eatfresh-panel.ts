@@ -40,8 +40,10 @@ import { live } from "lit/directives/live.js";
 import { pickLang, translate, type Lang, type StringKey } from "./i18n";
 import { panelStyles } from "./styles";
 import type {
+  CollectionForgetResponse,
   CollectionRecipe,
   CollectionRecipeResponse,
+  CollectionRestoreResponse,
   HomeAssistant,
   PanelRoute,
   PicnicProduct,
@@ -120,7 +122,8 @@ type Dialog =
       error: string;
     }
   | { kind: "item_menu"; item_id: number }
-  | { kind: "send"; n: number };
+  | { kind: "send"; n: number }
+  | { kind: "forget_missing"; id: number };
 
 const WIDE_MIN = 600;
 const ROOMY_MIN = 960;
@@ -188,6 +191,8 @@ export class EatFreshPanel extends LitElement {
   @state() private _koFor = 0;
   @state() private _koState: Load = "idle";
   @state() private _koError = "";
+  /** A restore or forget call for the missing ingredients is running. */
+  @state() private _koMissingBusy = false;
 
   @state() private _collection: CollectionRecipe[] = [];
   @state() private _collectionState: Load = "idle";
@@ -236,6 +241,10 @@ export class EatFreshPanel extends LitElement {
   private _searchSeq = 0;
   private _recipeSeq = 0;
   private _koSeq = 0;
+  /** Counts view changes; a late answer is only used while the view is still the one it was asked for. */
+  private _viewEpoch = 0;
+  /** Close events still to come from our own dialog.close() calls (they must not clear a dialog opened since). */
+  private _closeEvents = 0;
   private _collectionSeq = 0;
   private _plannerSeq = 0;
   private _toastTimer?: number;
@@ -310,7 +319,26 @@ export class EatFreshPanel extends LitElement {
       dlg.showModal();
       // Focus the first text field, so the keyboard comes up at once.
       dlg.querySelector<HTMLInputElement>("input")?.focus();
-    } else if (!this._dialog && dlg.open) dlg.close();
+    } else if (!this._dialog && dlg.open) {
+      this._closeEvents++;
+      dlg.close();
+    }
+  }
+
+  /** The native close event: Escape or a late event of our own close(). */
+  private _onDialogClose(e: Event): void {
+    if (this._closeEvents > 0) {
+      this._closeEvents--;
+      return;
+    }
+    if ((e.currentTarget as HTMLDialogElement).open) return;
+    this._dialog = undefined;
+  }
+
+  /** True while the view still shows recipe `id` of the collection, as it did at `epoch`. */
+  private _koStillShown(id: number, epoch: number): boolean {
+    const v = this._view;
+    return epoch === this._viewEpoch && v.name === "korecipe" && v.id === id;
   }
 
   private _t(key: StringKey, vars?: Record<string, string | number>): string {
@@ -353,6 +381,9 @@ export class EatFreshPanel extends LitElement {
     const changed = !this._sameView(this._view, view);
     if (changed) {
       this._view = view;
+      this._viewEpoch++;
+      // The lock of the missing-ingredient buttons belongs to the recipe that was open.
+      this._koMissingBusy = false;
       // A hint belongs to the view it came from; do not carry it along.
       this._clearToast();
       this._autoSaveUrl = undefined;
@@ -526,6 +557,72 @@ export class EatFreshPanel extends LitElement {
       this._koError = this._err(err);
       this._koState = "error";
     }
+  }
+
+  /** Restore the missing ingredients in KitchenOwl (adds only), then reload the recipe quietly. */
+  private async _restoreMissing(id: number): Promise<void> {
+    if (this._koMissingBusy) return;
+    this._koMissingBusy = true;
+    const epoch = this._viewEpoch;
+    try {
+      const res = await this._ws<CollectionRestoreResponse>({ type: "eatfresh/collection/restore", kitchenowl_id: id });
+      if (!this._koStillShown(id, epoch)) return;
+      if (!(await this._reloadAfter(id, epoch))) return;
+      const partial = Array.isArray(res?.missing) && res.missing.length > 0;
+      this._showToast(this._t(partial ? "miss_restore_partial" : "miss_restored"), partial ? "error" : "ok");
+    } catch (err) {
+      this._showToast(this._t("miss_restore_failed", { message: this._err(err) }), "error");
+    } finally {
+      if (epoch === this._viewEpoch) this._koMissingBusy = false;
+    }
+  }
+
+  /**
+   * Reload the recipe after a change that already went through. A failed
+   * reload gets its own message, so it is not mistaken for a failed change.
+   */
+  private async _reloadAfter(id: number, epoch: number): Promise<boolean> {
+    try {
+      return await this._refreshKo(id, epoch);
+    } catch (err) {
+      if (this._koStillShown(id, epoch)) {
+        this._showToast(this._t("miss_reload_failed", { message: this._err(err) }), "error");
+      }
+      return false;
+    }
+  }
+
+  /** EatFresh forgets the missing ingredients. KitchenOwl stays as it is. */
+  private async _forgetMissing(id: number): Promise<void> {
+    if (this._koMissingBusy) return;
+    this._koMissingBusy = true;
+    const epoch = this._viewEpoch;
+    try {
+      await this._ws<CollectionForgetResponse>({ type: "eatfresh/collection/forget", kitchenowl_id: id });
+      if (!this._koStillShown(id, epoch)) return;
+      if (!(await this._reloadAfter(id, epoch))) return;
+      this._showToast(this._t("miss_forgotten"), "ok");
+    } catch (err) {
+      this._showToast(this._t("miss_forget_failed", { message: this._err(err) }), "error");
+    } finally {
+      if (epoch === this._viewEpoch) this._koMissingBusy = false;
+    }
+  }
+
+  /**
+   * Reload the open recipe of the collection without the loading skeleton. Returns false when the answer was
+   * dropped: the view changed meanwhile, or a regular load started (that one wins). Never invalidates a load.
+   */
+  private async _refreshKo(id: number, epoch: number): Promise<boolean> {
+    const seq = this._koSeq;
+    const res = await this._ws<CollectionRecipeResponse>({ type: "eatfresh/collection/recipe", kitchenowl_id: id });
+    if (seq !== this._koSeq || !this._koStillShown(id, epoch)) return false;
+    this._ko = res;
+    this._koFor = id;
+    this._koState = "done";
+    const n = res.missing?.length;
+    if (n != null) this._patchRecipe(id, { missing: n });
+    return true;
   }
 
   private async _loadCollection(): Promise<void> {
@@ -1517,7 +1614,7 @@ export class EatFreshPanel extends LitElement {
         <dialog
           class="dlg"
           aria-label=${this._dialogTitle()}
-          @close=${() => (this._dialog = undefined)}
+          @close=${(e: Event) => this._onDialogClose(e)}
           @click=${(e: MouseEvent) => {
             // A tap on the dimmed backdrop closes the dialog.
             if (e.target === e.currentTarget) this._dialog = undefined;
@@ -1764,7 +1861,10 @@ export class EatFreshPanel extends LitElement {
     sourceLabel: string,
     actions: TemplateResult,
     extra: TemplateResult | typeof nothing = nothing,
+    missing: readonly string[] = [],
+    missingNotice: TemplateResult | typeof nothing = nothing,
   ): TemplateResult {
+    const missingSet = new Set(missing.map(lower));
     const facts: [string, string][] = [];
     const total = formatMinutes(this._lang, r.total_time);
     const prep = formatMinutes(this._lang, r.prep_time);
@@ -1797,12 +1897,19 @@ export class EatFreshPanel extends LitElement {
         ${r.ingredients.length
           ? html`<section class="panel-box">
               <h2>${this._t("ingredients")}</h2>
+              ${missingNotice}
               <ul class="ingredients">
                 ${r.ingredients.map((ing) => {
                   const qty = ingredientQty(this._lang, ing);
-                  return html`<li>
+                  const gone = missingSet.size > 0 && missingSet.has(lower(ing.name || ing.raw));
+                  return html`<li class=${gone ? "missing" : ""}>
                     <span class="qty">${qty}</span>
-                    <span>${ing.name || ing.raw}${ing.note ? html` <span class="note">(${ing.note})</span>` : nothing}</span>
+                    <span
+                      >${ing.name || ing.raw}${ing.note ? html` <span class="note">(${ing.note})</span>` : nothing}${gone
+                        ? html`<span class="miss-mark" title=${this._t("miss_item")}>${icon(mdiAlertCircleOutline)}</span
+                            ><span class="sr"> – ${this._t("miss_item")}</span>`
+                        : nothing}</span
+                    >
                   </li>`;
                 })}
               </ul>
@@ -1903,7 +2010,29 @@ export class EatFreshPanel extends LitElement {
           ${data.tags.map((t) => html`<li>${t}</li>`)}
         </ul>`
       : nothing}`;
-    return this._recipeLayout(r, isHttpUrl(r.url) ? hostOf(r.url) : "KitchenOwl", actions, extra);
+    const missing = Array.isArray(data.missing) ? data.missing : [];
+    const lock = this._koMissingBusy;
+    const notice = missing.length
+      ? html`<div class="banner info miss-notice" role="status">
+          ${icon(mdiInformationOutline)}
+          <div class="miss-body">
+            <span>${missing.length === 1 ? this._t("miss_one") : this._t("miss_many", { n: missing.length })}</span>
+            <div class="miss-actions">
+              <button class="btn small primary" ?disabled=${lock} @click=${() => void this._restoreMissing(id)}>
+                ${icon(mdiRefresh)}<span>${this._t("miss_restore")}</span>
+              </button>
+              <button
+                class="btn small"
+                ?disabled=${lock}
+                @click=${() => (this._dialog = { kind: "forget_missing", id })}
+              >
+                ${icon(mdiClose)}<span>${this._t("miss_forget")}</span>
+              </button>
+            </div>
+          </div>
+        </div>`
+      : nothing;
+    return this._recipeLayout(r, isHttpUrl(r.url) ? hostOf(r.url) : "KitchenOwl", actions, extra, missing, notice);
   }
 
   // ---- collection view
@@ -2511,6 +2640,22 @@ export class EatFreshPanel extends LitElement {
     `);
   }
 
+  private _renderForgetMissingDialog(d: Dialog & { kind: "forget_missing" }): TemplateResult {
+    return this._dialogFrame(
+      html`<p class="dlg-hint">${this._t("miss_forget_text")}</p>`,
+      html`<button class="btn" @click=${() => (this._dialog = undefined)}>${this._t("cancel")}</button>
+        <button
+          class="btn primary"
+          @click=${() => {
+            this._dialog = undefined;
+            void this._forgetMissing(d.id);
+          }}
+        >
+          ${icon(mdiClose)}<span>${this._t("miss_forget_confirm")}</span>
+        </button>`,
+    );
+  }
+
   private _renderSendDialog(d: Dialog & { kind: "send" }): TemplateResult {
     return this._dialogFrame(
       html`<p class="send-count">${d.n === 1 ? this._t("send_text_one") : this._t("send_text", { n: d.n })}</p>
@@ -2544,6 +2689,8 @@ export class EatFreshPanel extends LitElement {
         return this._item(d.item_id)?.name ?? "";
       case "send":
         return this._t("send_title");
+      case "forget_missing":
+        return this._t("miss_forget_title");
     }
   }
 
@@ -2577,6 +2724,8 @@ export class EatFreshPanel extends LitElement {
         return this._renderItemMenu(d);
       case "send":
         return this._renderSendDialog(d);
+      case "forget_missing":
+        return this._renderForgetMissingDialog(d);
     }
   }
 

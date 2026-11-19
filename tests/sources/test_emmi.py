@@ -95,7 +95,8 @@ async def test_get(source: EmmiSource, mock: aioresponses) -> None:
         (1.0, "EL", "Paprikapulver", "edelsüß"),
         (1.0, "l", "Brühe", None),
         (0.5, "TL", "Kümmel", None),
-        (None, None, "Salz und Pfeffer", None),
+        (None, None, "Salz", None),
+        (None, None, "Pfeffer", None),
     ]
 
 

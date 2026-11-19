@@ -15,12 +15,19 @@ Facts taken from the KitchenOwl 0.8.1 backend source:
   :func:`item_description` for the format it understands.
 * ``POST /api/recipe/<id>`` changes only the fields that are sent; ``tags``
   replaces the tag links (names, case sensitive, created when missing).
+  ``items`` replaces the ingredient links too: a link whose item name (case
+  sensitive) is not sent is removed. Each sent entry is found by name (any
+  case) or created as a new item. An entry may not carry ``id`` (the server
+  answers 400), ``optional`` defaults to true and ``description`` is required
+  for a new link. The answer is the full recipe with the item ids.
 * The meal plan (``/api/household/<id>/planner``) stores a real date per
   entry. See :meth:`KitchenOwlClient.list_planner`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
+import logging
 import math
 import re
 import time
@@ -33,7 +40,11 @@ import aiohttp
 from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, RecipeNotFound
 from .models import Ingredient, Recipe
 
+_LOGGER = logging.getLogger(__name__)
+
 REQUEST_TIMEOUT = 20  # seconds
+# KitchenOwl cuts item names to this many characters.
+MAX_ITEM_NAME = 128
 # How long ``find_by_source`` may reuse the last list of recipes. Creating a
 # recipe through this client drops the copy at once.
 RECIPE_LIST_TTL = 120.0  # seconds
@@ -302,6 +313,153 @@ def _item_names(raw: Any) -> list[str]:
     ]
 
 
+def ingredient_key(name: Any) -> str:
+    """Return the key of an ingredient name: lower case, single spaces."""
+    return " ".join(str(name).split()).lower()
+
+
+def _item_id(value: Any) -> int | None:
+    """Return a KitchenOwl item id, or None if it is not a whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def recipe_created_at(value: Any) -> int | None:
+    """Return KitchenOwl's ``created_at`` (milliseconds) or None if unusable."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def item_rows(raw: Any) -> list[dict[str, Any]]:
+    """Return the items of a recipe as ``[{id, name, description, optional}]``.
+
+    ``id`` is the KitchenOwl item id or None, ``description`` the amount text
+    (``""`` when it is empty or null). An answer without the field
+    ``description`` or ``optional`` gives None there: unknown, so
+    :func:`merge_items` keeps the remembered value. Entries without a name
+    are skipped.
+    """
+    if not isinstance(raw, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split())
+        if not name:
+            continue
+        description = item.get("description")
+        rows.append(
+            {
+                "id": _item_id(item.get("id")),
+                "name": name,
+                "description": None
+                if "description" not in item
+                else description
+                if isinstance(description, str)
+                else "",
+                "optional": None
+                if "optional" not in item
+                else item.get("optional") is True,
+            }
+        )
+    return rows
+
+
+def created_item_rows(ingredients: list[Ingredient]) -> list[dict[str, Any]]:
+    """Return the rows of the items ``create_recipe`` sends (without ids).
+
+    Names are cut like KitchenOwl does, so they match what it stores.
+    """
+    return [
+        {
+            "id": None,
+            "name": item["name"][:MAX_ITEM_NAME].strip(),
+            "description": item["description"],
+            "optional": item["optional"],
+        }
+        for item in _build_items(ingredients)
+        if item["name"][:MAX_ITEM_NAME].strip()
+    ]
+
+
+def merge_items(
+    memory: Iterable[Mapping[str, Any]] | None,
+    current: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Merge the remembered items of a recipe with the ones in KitchenOwl.
+
+    Return ``(memory, missing)``. A remembered entry matches a current item
+    with the same id, or else with the same name (any case, spaces folded).
+    A matched entry takes id, name, amount text and ``optional`` from
+    KitchenOwl (an amount text or ``optional`` of None is unknown: the
+    remembered one stays). Current items without an entry are added at the
+    end. Entries without a current item stay (in their place) and are
+    missing; their id is dropped, because KitchenOwl may give it to a new
+    item. An unmatched entry whose name is already that of a current item
+    is dropped: it is not missing, and restoring could never resolve it.
+    With no memory yet (``None``) the current items are the memory.
+    """
+    rows = [dict(row) for row in current]
+    if memory is None:
+        return rows, []
+    entries = [dict(entry) for entry in memory]
+    matched: dict[int, int] = {}
+    used: set[int] = set()
+    by_id: dict[int, int] = {}
+    by_name: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        if row.get("id") is not None:
+            by_id.setdefault(row["id"], index)
+        by_name.setdefault(ingredient_key(row.get("name", "")), []).append(index)
+    # Ids first, so a name never takes the item another entry has by id.
+    for position, entry in enumerate(entries):
+        index = by_id.get(entry["id"]) if entry.get("id") is not None else None
+        if index is not None and index not in used:
+            matched[position] = index
+            used.add(index)
+    for position, entry in enumerate(entries):
+        if position in matched:
+            continue
+        for index in by_name.get(ingredient_key(entry.get("name", "")), ()):
+            if index not in used:
+                matched[position] = index
+                used.add(index)
+                break
+    merged: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for position, entry in enumerate(entries):
+        if position in matched:
+            now = dict(rows[matched[position]])
+            for field in ("description", "optional"):
+                if now.get(field) is None and entry.get(field) is not None:
+                    now[field] = entry[field]
+            merged.append(now)
+        elif ingredient_key(entry.get("name", "")) in by_name:
+            continue
+        else:
+            gone = {**entry, "id": None}
+            merged.append(gone)
+            missing.append(dict(gone))
+    merged.extend(dict(row) for index, row in enumerate(rows) if index not in used)
+    return merged, missing
+
+
+def _copy_recipes(recipes: list[dict]) -> list[dict]:
+    """Return copies of reduced recipes, so callers cannot change the cache."""
+    return [
+        {
+            **item,
+            "tags": list(item["tags"]),
+            "items": list(item["items"]),
+            "item_rows": [dict(row) for row in item["item_rows"]],
+        }
+        for item in recipes
+    ]
+
+
 def _day_to_ms(day: date) -> int:
     """Return midnight UTC of ``day`` in milliseconds (KitchenOwl's format)."""
     midnight = datetime(day.year, day.month, day.day, tzinfo=UTC)
@@ -418,6 +576,23 @@ class KitchenOwlClient:
         self._token = token
         # household id -> (time of fetch, recipes), for find_by_source only.
         self._recipe_lists: dict[int, tuple[float, list[dict]]] = {}
+        # Called with (household id, recipes) after every recipe list that
+        # was loaded, and with the recipe after every full recipe read or
+        # written, so the caller can learn from answers it gets anyway.
+        self.on_recipe_list: Callable[[int, list[dict]], None] | None = None
+        self.on_recipe: Callable[[dict], None] | None = None
+        # ``created_at`` of the recipe created last, see :meth:`created_at_of`.
+        self._created_at: dict[int, int] = {}
+
+    @staticmethod
+    def _notify(listener: Callable[..., None] | None, *args: Any) -> None:
+        """Call a listener; a failing listener never breaks a request."""
+        if listener is None:
+            return
+        try:
+            listener(*args)
+        except Exception:
+            _LOGGER.exception("Error in a KitchenOwl listener")
 
     # ------------------------------------------------------------------ core
 
@@ -540,8 +715,11 @@ class KitchenOwlClient:
     async def list_recipes(self, household_id: int) -> list[dict]:
         """Return all recipes of a household, reduced to the fields we use.
 
-        Fields: id, name, source, photo, time, yields, ``tags`` (names) and
-        ``items`` (names of the ingredients, for the search of the collection).
+        Fields: id, name, source, photo, time, yields, ``tags`` (names),
+        ``items`` (names of the ingredients, for the search of the collection)
+        and ``item_rows`` (``[{id, name, description, optional}]``, see
+        :func:`item_rows`) and ``created_at`` (milliseconds or None; a
+        reused id gets a new one, see :func:`recipe_created_at`).
         """
         path = f"/api/household/{int(household_id)}/recipe"
         data = self._expect(await self._request("GET", path), list, path)
@@ -555,14 +733,14 @@ class KitchenOwlClient:
                 "yields": item.get("yields"),
                 "tags": _tag_names(item.get("tags")),
                 "items": _item_names(item.get("items")),
+                "item_rows": item_rows(item.get("items")),
+                "created_at": recipe_created_at(item.get("created_at")),
             }
             for item in data
         ]
         self._recipe_lists[int(household_id)] = (time.monotonic(), recipes)
-        return [
-            {**item, "tags": list(item["tags"]), "items": list(item["items"])}
-            for item in recipes
-        ]
+        self._notify(self.on_recipe_list, int(household_id), _copy_recipes(recipes))
+        return _copy_recipes(recipes)
 
     async def _cached_recipes(
         self, household_id: int, max_age: float = RECIPE_LIST_TTL
@@ -601,7 +779,9 @@ class KitchenOwlClient:
     async def get_recipe(self, recipe_id: int) -> dict:
         """Return one full recipe (``GET /api/recipe/<id>``)."""
         path = f"/api/recipe/{int(recipe_id)}"
-        return self._expect(await self._request("GET", path), dict, path)
+        data = self._expect(await self._request("GET", path), dict, path)
+        self._notify(self.on_recipe, data)
+        return data
 
     async def list_tags(self, household_id: int) -> list[str]:
         """Return the names of all tags of a household (``GET .../tag``)."""
@@ -754,19 +934,119 @@ class KitchenOwlClient:
         finally:
             self.forget_recipes(household_id)
         try:
-            return int(data["id"])
+            recipe_id = int(data["id"])
         except (KeyError, TypeError, ValueError) as err:
             raise KitchenOwlError("KitchenOwl did not return a recipe id") from err
+        created_at = recipe_created_at(data.get("created_at"))
+        self._created_at = {} if created_at is None else {recipe_id: created_at}
+        return recipe_id
+
+    def created_at_of(self, recipe_id: int) -> int | None:
+        """Return KitchenOwl's creation time of the recipe created last.
+
+        None for any other recipe. It tells a new recipe from a deleted one
+        whose id KitchenOwl gave away again.
+        """
+        return self._created_at.get(int(recipe_id))
+
+    async def restore_recipe_items(
+        self, recipe_id: int, missing: Iterable[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        """Add remembered items back to a recipe; never remove one.
+
+        ``missing`` are rows like :func:`item_rows`. The recipe is read first
+        (``GET /api/recipe/<id>``); rows it has now (by id or name, see
+        :func:`merge_items`) are left out. If any are left, ``POST
+        /api/recipe/<id>`` sends ``items``: every item the recipe has with
+        its name, amount text and ``optional`` unchanged, then the missing
+        ones. KitchenOwl replaces the item links with this list, so nothing
+        the recipe had is lost. If the read fails, nothing is written.
+
+        Measured on KitchenOwl (19.11.2026): an item sent without
+        ``description`` keeps its amount text, but one sent without
+        ``optional`` becomes optional, and null is refused (HTTP 400). So an
+        amount text that is not text is left out (kept as it is), and an item
+        whose ``optional`` is not true or false stops the restore before
+        anything is written. These checks only run when there is something
+        to add: a recipe that misses nothing is returned as it was read.
+
+        Return ``{restored, missing, recipe}``: the names added, the names
+        that are still not in the answer (normally none) and the recipe as
+        KitchenOwl returned it last.
+        """
+        path = f"/api/recipe/{int(recipe_id)}"
+        recipe = await self.get_recipe(recipe_id)
+        raw = recipe.get("items")
+        if not isinstance(raw, list):
+            raise KitchenOwlError(f"Unexpected answer from KitchenOwl ({path})")
+        current = item_rows(raw)
+        _, wanted = merge_items(missing, current)
+        seen = {ingredient_key(row["name"]) for row in current}
+        new_items: list[dict[str, Any]] = []
+        for row in wanted:
+            name = str(row.get("name") or "")[:MAX_ITEM_NAME].strip()
+            if not name or ingredient_key(name) in seen:
+                continue
+            seen.add(ingredient_key(name))
+            description = row.get("description")
+            new_items.append(
+                {
+                    "name": name,
+                    "description": description if isinstance(description, str) else "",
+                    "optional": row.get("optional") is True,
+                }
+            )
+        if not new_items:
+            return {"restored": [], "missing": [], "recipe": recipe}
+        # Something will be written: now every item the recipe has must be
+        # safe to send back, or nothing is sent at all.
+        items: list[dict[str, Any]] = []
+        for item in raw:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not isinstance(name, str) or not name.strip():
+                # Not sending an item would remove it from the recipe.
+                raise KitchenOwlError(f"Unexpected item from KitchenOwl ({path})")
+            if not isinstance(item.get("optional"), bool):
+                # Sent without it, KitchenOwl would make the item optional.
+                raise KitchenOwlError(f"Unexpected item from KitchenOwl ({path})")
+            entry: dict[str, Any] = {"name": name}
+            if isinstance(item.get("description"), str):
+                entry["description"] = item["description"]
+            entry["optional"] = item["optional"]
+            items.append(entry)
+        items.extend(new_items)
+        added = [entry["name"] for entry in new_items]
+        # The cached recipe list carries items, so it is out of date now.
+        self.forget_recipes()
+        try:
+            data = self._expect(
+                await self._request("POST", path, json={"items": items}), dict, path
+            )
+        finally:
+            self.forget_recipes()
+        self._notify(self.on_recipe, data)
+        present = {ingredient_key(row["name"]) for row in item_rows(data.get("items"))}
+        return {
+            "restored": [name for name in added if ingredient_key(name) in present],
+            "missing": [
+                entry["name"]
+                for entry in items
+                if ingredient_key(entry["name"]) not in present
+            ],
+            "recipe": data,
+        }
 
     async def add_recipe_to_shoppinglist(
-        self, shoppinglist_id: int, recipe_id: int
+        self, shoppinglist_id: int, recipe_id: int, recipe: dict | None = None
     ) -> int:
         """Put all ingredients of a recipe on a list; return how many.
 
         Uses ``POST /api/shoppinglist/<id>/recipeitems``, the only call that
-        merges amounts with entries already on the list.
+        merges amounts with entries already on the list. ``recipe`` is the
+        recipe as KitchenOwl just returned it; without it, it is read.
         """
-        recipe = await self.get_recipe(recipe_id)
+        if recipe is None:
+            recipe = await self.get_recipe(recipe_id)
         items = [
             {
                 "id": int(item["id"]),

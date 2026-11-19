@@ -46,7 +46,18 @@ _UNIT_SPELLINGS: dict[str, tuple[str, ...]] = {
     "Stück": ("stück", "stueck", "stk", "stck", "st"),
     "Bund": ("bund", "bünde", "buend"),
     "Dose": ("dose", "dosen"),
-    "Pck.": ("pck", "pkg", "pk", "päckchen", "paeckchen", "packung", "packungen", "päckchens"),
+    "Pck.": (
+        "pck",
+        "pkg",
+        "pk",
+        "päck",
+        "paeck",
+        "päckchen",
+        "paeckchen",
+        "packung",
+        "packungen",
+        "päckchens",
+    ),
     "Prise": ("prise", "prisen"),
     "Msp.": ("msp", "messerspitze", "messerspitzen"),
     "Zehe": ("zehe", "zehen"),
@@ -81,7 +92,24 @@ _NUMBER_WORDS = {"ein": 1.0, "eine": 1.0, "einen": 1.0, "einem": 1.0, "einer": 1
 _ODD_SPACES = ("\u00a0", "\u202f", "\u2009", "\u2007", "\u2002", "\u2003")
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
-_PLURAL_SUFFIX_RE = re.compile(r"(?<=[^\W\d_])\((?:n|en|e|s|r)\)")
+_PLURAL_SUFFIX_RE = re.compile(r"(?<=[^\W\d_])\((?:n|en|e|er|s|r)\)")
+# Suffixes that make a real plural ("Ei(er)" -> "Eier"); "(s)" and "(r)" are
+# only dropped.
+_PLURAL_ENDINGS = ("n", "en", "e", "er")
+_UNIT_SUFFIX_RE = re.compile(r"^([^\W\d_]+\.?)\((?:n|en|e|er|s|r)\)")
+_CAPITAL_WORD_RE = re.compile(r"[^\W\d_][\w-]*")
+_PAIR_RE = re.compile(r"^(salz|pfeffer)\s*(?:und|&)\s*(salz|pfeffer)$", re.IGNORECASE)
+_VAGUE_AMOUNT_RE = re.compile(
+    r"^(?P<phrase>nach\s+(?:geschmack|belieben|bedarf))\s+(?P<name>\S.*)$", re.IGNORECASE
+)
+# Lower case words that end like an inflected adjective but are none.
+_NOT_ADJECTIVES = frozenset(
+    "oder aber bitte sonst etwa eher sehr gerne lieber weniger wahlweise ohne "
+    "ggf evtl eventuell mehr viele andere alternativ optional beliebige "
+    "beliebiger beliebiges nötige nötiger nötiges eine einer eines einige "
+    "wenige keine keiner keines".split()
+)
+_ADJECTIVE_RE = re.compile(r"^[a-zäöüß]{3,}(?:e|er|es)$")
 _APPROX_RE = re.compile(r"^(?:ca\.?|circa|etwa|ungefähr|zirka|je)\s+", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^[-–•*·]\s+")
 
@@ -173,11 +201,108 @@ def normalize_unit(text: str | None) -> str | None:
     return _UNIT_LOOKUP.get(key, cleaned)
 
 
-def clean_name(text: str | None) -> str:
-    """Tidy an ingredient name given on its own ("Kartoffel(n)" -> "Kartoffel")."""
+def resolve_plural(text: str, amount: float | None, unit: str | None = None) -> str:
+    """Resolve a plural suffix in brackets by the amount and the unit.
+
+    The singular is used only for an amount of exactly 1 with no unit:
+    ``1 Ei(er)`` gives ``Ei``. Every other case gives the plural (``2 Ei(er)``
+    gives ``Eier``, ``1 kg Kartoffel(n)`` gives ``Kartoffeln``, ``Zwiebel(n)``
+    without an amount gives ``Zwiebeln``), so that one ingredient does not
+    split into two articles. ``(s)`` and ``(r)`` are always dropped.
+    """
+    singular = amount == 1 and not unit
+
+    def pick(match: re.Match[str]) -> str:
+        ending = match.group(0)[1:-1]
+        if ending in _PLURAL_ENDINGS and not singular:
+            return ending
+        return ""
+
+    return _PLURAL_SUFFIX_RE.sub(pick, text)
+
+
+def clean_name(
+    text: str | None, amount: float | None = None, unit: str | None = None
+) -> str:
+    """Tidy an ingredient name given on its own.
+
+    A plural suffix is resolved by ``amount`` and ``unit`` (see
+    :func:`resolve_plural`): "Kartoffel(n)" gives "Kartoffel" for an amount of
+    1 without a unit, otherwise "Kartoffeln".
+    """
     if text is None:
         return ""
-    return _tidy_name(_PLURAL_SUFFIX_RE.sub("", _clean(str(text))))
+    return _tidy_name(resolve_plural(_clean(str(text)), amount, unit))
+
+
+def adjectives_first(name: str) -> str:
+    """Move trailing adjectives in front of the noun: "Butter, weiche" -> "weiche Butter".
+
+    Only for a noun followed by a comma and one or two lower case, inflected
+    adjectives. Anything else ("Mehl, Type 405", "Wasser, oder Rum") stays as
+    it is.
+    """
+    noun, comma, tail = name.partition(",")
+    if not comma or "," in noun or "(" in name:
+        return name
+    noun = noun.strip()
+    words = [word for word in re.split(r"[\s,]+", tail.strip()) if word]
+    if not noun or not noun[0].isupper() or not 1 <= len(words) <= 2:
+        return name
+    for word in words:
+        if word in _NOT_ADJECTIVES or _ADJECTIVE_RE.match(word) is None:
+            return name
+    return f"{' '.join(words)} {noun}"
+
+
+def clean_note(text: str | None) -> str | None:
+    """Tidy a note: no comma or semicolon at the start or end, one space."""
+    if text is None:
+        return None
+    cleaned = _SPACE_RE.sub(" ", str(text)).strip(" ,;")
+    return cleaned or None
+
+
+def split_vague_amount(ingredient: Ingredient) -> Ingredient:
+    """Turn "nach Geschmack Salz" (no amount) into name "Salz", note "nach Geschmack"."""
+    if ingredient.amount is not None or ingredient.unit is not None:
+        return ingredient
+    match = _VAGUE_AMOUNT_RE.match(ingredient.name)
+    if match is None:
+        return ingredient
+    note = ", ".join(item for item in (match.group("phrase"), ingredient.note) if item)
+    return Ingredient(
+        name=_tidy_name(match.group("name")),
+        amount=None,
+        unit=None,
+        note=note,
+        raw=ingredient.raw,
+    )
+
+
+def split_pair(ingredient: Ingredient) -> list[Ingredient]:
+    """Split "Salz und Pfeffer" (no amount) into two ingredients.
+
+    Only this pair, in both orders and with "&". Everything else comes back
+    unchanged as a one-item list.
+    """
+    if ingredient.amount is not None or ingredient.unit is not None:
+        return [ingredient]
+    match = _PAIR_RE.match(ingredient.name.strip())
+    if match is None or match.group(1).lower() == match.group(2).lower():
+        return [ingredient]
+    return [
+        Ingredient(name=part.capitalize(), note=ingredient.note, raw=ingredient.raw)
+        for part in (match.group(1), match.group(2))
+    ]
+
+
+def finish_ingredients(items: list[Ingredient]) -> list[Ingredient]:
+    """Apply the rules every source shares to a list of ingredients."""
+    result: list[Ingredient] = []
+    for item in items:
+        result.extend(split_pair(split_vague_amount(item)))
+    return result
 
 
 def format_amount(amount: float | None) -> str:
@@ -188,8 +313,19 @@ def format_amount(amount: float | None) -> str:
     return text.replace(".", ",")
 
 
+def _has_capital_word(text: str) -> bool:
+    """Return True if a word of ``text`` starts with a capital (a noun)."""
+    return any(word[0].isupper() for word in _CAPITAL_WORD_RE.findall(text))
+
+
 def _split_top_level_comma(text: str) -> tuple[str, str | None]:
-    """Split at the first comma that is not inside brackets."""
+    """Split at the first comma outside brackets.
+
+    Exception: "gemahlene, geschälte Mandeln" is one name. The part before the
+    comma holds no capitalized word (no noun yet) and the part after it does
+    (the noun comes later). "onion, finely chopped" and "butter, melted" have
+    no noun after the comma and are split as always.
+    """
     depth = 0
     for index, char in enumerate(text):
         if char == "(":
@@ -197,27 +333,43 @@ def _split_top_level_comma(text: str) -> tuple[str, str | None]:
         elif char == ")":
             depth = max(0, depth - 1)
         elif char == "," and depth == 0:
-            return text[:index], text[index + 1 :]
+            before, _ = _extract_brackets(text[:index])
+            after, _ = _extract_brackets(text[index + 1 :])
+            if _has_capital_word(before) or not _has_capital_word(after):
+                return text[:index], text[index + 1 :]
     return text, None
 
 
 def _extract_brackets(text: str) -> tuple[str, list[str]]:
-    """Remove ``(...)`` groups and return the text plus their contents."""
+    """Remove outermost ``(...)`` groups and return the text plus their contents.
+
+    A group inside a group stays in the note as written.
+    """
     notes: list[str] = []
-
-    def collect(match: re.Match[str]) -> str:
-        inner = match.group(1).strip()
-        if inner:
-            notes.append(inner)
-        return " "
-
-    previous = None
-    while previous != text:
-        previous = text
-        text = re.sub(r"\(([^()]*)\)", collect, text)
-    # Unbalanced bracket leftovers.
-    text = text.replace("(", " ").replace(")", " ")
-    return _SPACE_RE.sub(" ", text).strip(), notes
+    kept: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                kept.append(" ")
+                continue
+            depth -= 1
+            if depth == 0:
+                inner = _SPACE_RE.sub(" ", text[start + 1 : index]).strip()
+                if inner:
+                    notes.append(inner)
+                kept.append(" ")
+        elif depth == 0:
+            kept.append(char)
+    if depth > 0:
+        # Unbalanced bracket: keep its text as part of the line.
+        kept.append(" " + text[start + 1 :].replace("(", " ").replace(")", " "))
+    return _SPACE_RE.sub(" ", "".join(kept)).strip(), notes
 
 
 def _tidy_name(name: str) -> str:
@@ -239,6 +391,14 @@ def _take_unit(rest: str) -> tuple[str | None, str]:
     return canonical, rest[match.end() :].lstrip()
 
 
+def _drop_unit_suffix(rest: str) -> str:
+    """Drop a plural suffix after a leading unit word: "Zehe(n) Knoblauch"."""
+    match = _UNIT_SUFFIX_RE.match(rest)
+    if match is None or match.group(1).rstrip(".").lower() not in _UNIT_LOOKUP:
+        return rest
+    return match.group(1) + rest[match.end() :]
+
+
 def parse_ingredient(line: str) -> Ingredient:
     """Split a German ingredient line into amount, unit, name and note.
 
@@ -251,7 +411,6 @@ def parse_ingredient(line: str) -> Ingredient:
     """
     raw = _clean(line)
     text = _BULLET_RE.sub("", raw)
-    text = _PLURAL_SUFFIX_RE.sub("", text)
     text = _APPROX_RE.sub("", text).strip()
     notes: list[str] = []
 
@@ -272,26 +431,35 @@ def parse_ingredient(line: str) -> Ingredient:
                 notes.append(lead.group(1).strip())
             rest = rest[lead.end() :]
         rest = rest.lstrip(" .")
-        unit, rest = _take_unit(rest)
+        unit, rest = _take_unit(_drop_unit_suffix(rest))
         rest = rest.lstrip(" .") if unit is not None else rest
     else:
         word = _WORD_RE.match(text)
         if word and word.group(1).lower() in _NUMBER_WORDS:
-            candidate_unit, after = _take_unit(text[word.end() :].lstrip())
+            candidate_unit, after = _take_unit(
+                _drop_unit_suffix(text[word.end() :].lstrip())
+            )
             if candidate_unit is not None:
                 amount = _NUMBER_WORDS[word.group(1).lower()]
                 unit, rest = candidate_unit, after
 
     has_amount = amount is not None
-    rest, bracket_notes = _extract_brackets(rest)
-    notes.extend(bracket_notes)
+    rest = resolve_plural(rest, amount, unit)
 
+    # Notes keep the order of the line: brackets in the name, then the text
+    # after the comma, then its brackets.
     if has_amount:
         name_part, tail = _split_top_level_comma(rest)
-        if tail is not None and tail.strip():
-            notes.append(_tidy_name(tail))
+        name_part, bracket_notes = _extract_brackets(name_part)
+        notes.extend(bracket_notes)
+        if tail is not None:
+            tail_text, tail_notes = _extract_brackets(tail)
+            if _tidy_name(tail_text):
+                notes.append(_tidy_name(tail_text))
+            notes.extend(tail_notes)
     else:
-        name_part = rest
+        name_part, bracket_notes = _extract_brackets(rest)
+        notes.extend(bracket_notes)
 
     name = _tidy_name(name_part)
     if not name and unit is not None:

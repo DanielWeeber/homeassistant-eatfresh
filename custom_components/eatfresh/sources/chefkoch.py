@@ -12,7 +12,14 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..errors import RecipeNotFound, SourceError
-from ..ingredients import clean_name, format_amount, normalize_unit
+from ..ingredients import (
+    adjectives_first,
+    clean_name,
+    clean_note,
+    finish_ingredients,
+    format_amount,
+    normalize_unit,
+)
 from ..models import Ingredient, Recipe, SearchHit
 from .base import RecipeSource, first_int, host_of, html_to_text, minutes_or_none, unique_tags
 
@@ -134,14 +141,20 @@ class ChefkochSource(RecipeSource):
             for entry in entries if isinstance(entries, list) else []:
                 if not isinstance(entry, dict):
                     continue
-                name = clean_name(entry.get("name"))
-                if not name:
-                    continue
                 value = entry.get("amount")
                 amount = float(value) if isinstance(value, (int, float)) and value > 0 else None
                 unit_text = html_to_text(entry.get("unit"))
+                # "Butter, weiche" is read as "weiche Butter".
+                name = adjectives_first(
+                    clean_name(
+                        entry.get("name"), amount, unit_text if amount is not None else None
+                    )
+                )
+                if not name:
+                    continue
                 unit = normalize_unit(unit_text) if amount is not None else None
-                info = html_to_text(entry.get("usageInfo")) or None
+                # The API sometimes sends ", feiner": no comma at the start.
+                info = clean_note(html_to_text(entry.get("usageInfo")))
                 raw = " ".join(
                     part
                     for part in (
@@ -156,7 +169,7 @@ class ChefkochSource(RecipeSource):
                 result.append(
                     Ingredient(name=name, amount=amount, unit=unit, note=info, raw=raw)
                 )
-        return result
+        return finish_ingredients(result)
 
     @staticmethod
     def _steps(text: object) -> list[str]:

@@ -65,7 +65,7 @@ CASES = [
     ("1 Glas Gurken", (1.0, "Glas", "Gurken", None)),
     ("1 Schuss Essig", (1.0, "Schuss", "Essig", None)),
     ("- 2 EL Butter", (2.0, "EL", "Butter", None)),
-    ("1 kg Kartoffel(n)", (1.0, "kg", "Kartoffel", None)),
+    ("1 kg Kartoffel(n)", (1.0, "kg", "Kartoffeln", None)),
     ("1 Knoblauchzehe", (1.0, None, "Knoblauchzehe", None)),
     ("2 Becher", (2.0, None, "Becher", None)),
     # Lines without a quantity keep the whole text as name.
@@ -146,7 +146,9 @@ def test_normalize_unit(text: str | None, unit: str | None) -> None:
 
 
 def test_clean_name_and_format_amount() -> None:
-    assert clean_name(" Kartoffel(n) ") == "Kartoffel"
+    assert clean_name(" Kartoffel(n) ") == "Kartoffeln"
+    assert clean_name("Kartoffel(n)", 1.0) == "Kartoffel"
+    assert clean_name("Kartoffel(n)", 1.0, "kg") == "Kartoffeln"
     assert clean_name(None) == ""
     assert format_amount(1.5) == "1,5"
     assert format_amount(2.0) == "2"

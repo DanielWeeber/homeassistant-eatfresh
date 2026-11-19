@@ -229,6 +229,10 @@ def mock_client() -> MagicMock:
     client.find_by_source = AsyncMock(return_value=None)
     client.create_recipe = AsyncMock(return_value=42)
     client.add_recipe_to_shoppinglist = AsyncMock(return_value=3)
+    # Nothing to restore: the recipe comes back as None, so it is read again.
+    client.restore_recipe_items = AsyncMock(
+        return_value={"restored": [], "missing": [], "recipe": None}
+    )
     client.fetch_photo = AsyncMock(return_value=(b"\xff\xd8photo", "image/jpeg"))
     client.list_tags = AsyncMock(return_value=["Suppe", "Schnell"])
     client.set_recipe_tags = AsyncMock(side_effect=lambda recipe_id, tags: list(tags))

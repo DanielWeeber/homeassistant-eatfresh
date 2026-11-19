@@ -25,9 +25,20 @@ from .const import (
     STORAGE_SAVE_DELAY,
     STORAGE_VERSION,
 )
-from .kitchenowl import normalize_source
+from .kitchenowl import (
+    MAX_ITEM_NAME,
+    merge_items,
+    normalize_source,
+    recipe_created_at,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Limits of the memory of ingredients: beyond them nothing new is remembered.
+MAX_REMEMBERED_ITEMS = 300
+MAX_REMEMBERED_RECIPES = 3000
+# A recipe is forgotten once it has been in no recipe list for this long.
+FORGET_RECIPE_AFTER = timedelta(days=30)
 
 
 class Favorite(TypedDict):
@@ -54,7 +65,8 @@ class _EatFreshStore(Store[dict[str, Any]]):
         """Keep everything and add what newer versions expect.
 
         1.1 (EatFresh 0.1.0) had only favorites; 1.2 adds hidden recipes;
-        1.3 (EatFresh 0.4.0) adds the Picnic parts.
+        1.3 (EatFresh 0.4.0) adds the Picnic parts; 1.4 (EatFresh 0.4.1) adds
+        the remembered ingredients of the recipes.
         """
         data = dict(old_data or {})
         if old_major_version == 1 and old_minor_version < 2:
@@ -63,7 +75,33 @@ class _EatFreshStore(Store[dict[str, Any]]):
             data.setdefault("picnic_map", {})
             data.setdefault("picnic_skip", [])
             data.setdefault("picnic_sent", {})
+        if old_major_version == 1 and old_minor_version < 4:
+            data.setdefault("ingredients", {})
         return data
+
+
+class RememberedItem(TypedDict):
+    """One remembered ingredient of a KitchenOwl recipe.
+
+    ``id`` is the KitchenOwl item id, or None when it is not known (created
+    by EatFresh and not read back yet, or missing in KitchenOwl).
+    """
+
+    id: int | None
+    name: str
+    description: str
+    optional: bool
+
+
+class IngredientMeta(TypedDict, total=False):
+    """What EatFresh knows about a remembered recipe besides its items.
+
+    ``seen`` is the day (``YYYY-MM-DD``) it was last in a recipe list or
+    read; ``created_at`` KitchenOwl's creation time in milliseconds.
+    """
+
+    seen: str
+    created_at: int
 
 
 class PicnicProduct(TypedDict):
@@ -104,6 +142,12 @@ class FavoritesStore:
     ``week_list_done`` holds, per Monday, the planned entries
     (``YYYY-MM-DD:<id>``) that went through before a transfer stopped
     halfway, so a second try sends only the rest.
+    ``ingredients`` holds, per KitchenOwl recipe id (as text), the
+    ingredients EatFresh has seen in it, so an item deleted in KitchenOwl is
+    not lost (see :func:`merge_items`). ``ingredient_meta`` holds, per
+    recipe id, ``seen`` (the day, ``YYYY-MM-DD``, the recipe was last in a
+    recipe list or read) and ``created_at`` (KitchenOwl's creation time in
+    milliseconds, when known), so a reused id is noticed.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -118,6 +162,8 @@ class FavoritesStore:
         self._picnic_map: dict[str, PicnicProduct] = {}
         self._picnic_skip: list[str] = []
         self._picnic_sent: dict[str, PicnicSent] = {}
+        self._ingredients: dict[str, list[RememberedItem]] = {}
+        self._ingredient_meta: dict[str, IngredientMeta] = {}
 
     async def async_load(self) -> None:
         """Load the favorites and hidden recipes from disk.
@@ -172,6 +218,33 @@ class FavoritesStore:
             for key, value in _section(data, "picnic_sent").items()
             if str(key).isdigit() and (sent := _picnic_sent(value)) is not None
         }
+        self._ingredients = {}
+        for key, value in _section(data, "ingredients").items():
+            if not str(key).isdigit() or not isinstance(value, list):
+                continue
+            if len(self._ingredients) >= MAX_REMEMBERED_RECIPES:
+                _LOGGER.debug("Ignoring remembered ingredients beyond the limit")
+                break
+            self._ingredients[str(int(key))] = [
+                row for item in value if (row := _remembered_item(item)) is not None
+            ][:MAX_REMEMBERED_ITEMS]
+        stored_meta = {
+            str(int(key)): value
+            for key, value in _section(data, "ingredient_meta").items()
+            if str(key).isdigit()
+        }
+        self._ingredient_meta = {}
+        today = _today()
+        filled = False
+        for key in self._ingredients:
+            meta = _ingredient_meta(stored_meta.get(key))
+            if "seen" not in meta:
+                # Not known yet (memory of an older file): seen today.
+                meta["seen"] = today
+                filled = True
+            self._ingredient_meta[key] = meta
+        if filled:
+            self._schedule_save()
 
     @callback
     def _data_to_save(self) -> dict[str, Any]:
@@ -187,6 +260,13 @@ class FavoritesStore:
             "picnic_skip": list(self._picnic_skip),
             "picnic_sent": {
                 key: dict(value) for key, value in self._picnic_sent.items()
+            },
+            "ingredients": {
+                key: [dict(row) for row in rows]
+                for key, rows in self._ingredients.items()
+            },
+            "ingredient_meta": {
+                key: dict(value) for key, value in self._ingredient_meta.items()
             },
         }
 
@@ -311,6 +391,163 @@ class FavoritesStore:
         self._schedule_save()
         return True
 
+
+    # ----- remembered ingredients ---------------------------------------
+
+    @callback
+    def recipe_ingredients(self, kitchenowl_id: int) -> list[RememberedItem] | None:
+        """Return the remembered ingredients of a recipe, or None if unknown."""
+        rows = self._ingredients.get(str(int(kitchenowl_id)))
+        if rows is None:
+            return None
+        return [RememberedItem(**row) for row in rows]
+
+    @callback
+    def recipe_seen(self, kitchenowl_id: int) -> str | None:
+        """Return the day a remembered recipe was last seen, or None."""
+        return self._ingredient_meta.get(str(int(kitchenowl_id)), {}).get("seen")
+
+    @callback
+    def _room_for(self, key: str) -> bool:
+        """Return whether a recipe may be remembered (limit of recipes)."""
+        if key in self._ingredients or len(self._ingredients) < MAX_REMEMBERED_RECIPES:
+            return True
+        _LOGGER.debug(
+            "Not remembering the ingredients of recipe %s: %s recipes remembered",
+            key,
+            MAX_REMEMBERED_RECIPES,
+        )
+        return False
+
+    @callback
+    def _put_ingredients(
+        self, key: str, rows: list[RememberedItem], meta: IngredientMeta
+    ) -> None:
+        """Store rows (cut to the limit) and meta; save only on a change."""
+        if len(rows) > MAX_REMEMBERED_ITEMS:
+            _LOGGER.debug(
+                "Remembering only %s ingredients of recipe %s",
+                MAX_REMEMBERED_ITEMS,
+                key,
+            )
+            rows = rows[:MAX_REMEMBERED_ITEMS]
+        if self._ingredients.get(key) == rows and self._ingredient_meta.get(key) == meta:
+            return
+        self._ingredients[key] = rows
+        self._ingredient_meta[key] = meta
+        self._schedule_save()
+
+    @callback
+    def async_learn_ingredients(
+        self, kitchenowl_id: int, current: Iterable[Any], created_at: Any = None
+    ) -> list[RememberedItem]:
+        """Merge the current items of a recipe into the memory.
+
+        Return the remembered ingredients that are missing in KitchenOwl.
+        ``created_at`` is KitchenOwl's creation time of the recipe: if it
+        differs from the remembered one, the id was given to a new recipe and
+        the memory starts over with the current items. Without it nothing is
+        checked. The recipe counts as seen today. Saved only when something
+        changed (so the date costs at most one write a day).
+        """
+        key = str(int(kitchenowl_id))
+        if not self._room_for(key):
+            return []
+        rows = [
+            row
+            for item in current
+            if (row := _remembered_item(item, keep_unknown=True)) is not None
+        ]
+        memory = self._ingredients.get(key)
+        meta = dict(self._ingredient_meta.get(key, {}))
+        created = _created_at(created_at)
+        if (
+            memory is not None
+            and created is not None
+            and meta.get("created_at") is not None
+            and meta["created_at"] != created
+        ):
+            _LOGGER.debug(
+                "Recipe %s is a new recipe in KitchenOwl; its memory starts over", key
+            )
+            memory = None
+        merged, missing = merge_items(memory, rows)
+        if created is not None:
+            meta["created_at"] = created
+        meta["seen"] = _today()
+        self._put_ingredients(
+            key,
+            [row for item in merged if (row := _remembered_item(item)) is not None],
+            IngredientMeta(**meta),
+        )
+        remembered = self._ingredients.get(key, [])
+        return [
+            RememberedItem(**row)
+            for item in missing
+            if (row := _remembered_item(item)) is not None and row in remembered
+        ]
+
+    @callback
+    def async_set_ingredients(self, kitchenowl_id: int, items: Iterable[Any]) -> None:
+        """Replace the remembered ingredients of a recipe (keeps its meta)."""
+        key = str(int(kitchenowl_id))
+        if not self._room_for(key):
+            return
+        rows = [row for item in items if (row := _remembered_item(item)) is not None]
+        meta = IngredientMeta(**self._ingredient_meta.get(key, {}))
+        meta.setdefault("seen", _today())
+        self._put_ingredients(key, rows, meta)
+
+    @callback
+    def async_start_ingredients(
+        self, kitchenowl_id: int, items: Iterable[Any], created_at: Any = None
+    ) -> None:
+        """Remember the items of a recipe EatFresh just created.
+
+        Replaces whatever was remembered for this id before (KitchenOwl may
+        give the id of a deleted recipe to a new one), without mixing.
+        ``created_at`` is KitchenOwl's creation time if the answer had one.
+        """
+        key = str(int(kitchenowl_id))
+        if not self._room_for(key):
+            return
+        rows = [row for item in items if (row := _remembered_item(item)) is not None]
+        meta = IngredientMeta(seen=_today())
+        if (created := recipe_created_at(created_at)) is not None:
+            meta["created_at"] = created
+        self._put_ingredients(key, rows, meta)
+
+    @callback
+    def async_prune_ingredients(self, keep: Iterable[int]) -> None:
+        """Note the recipes of a fresh list; forget long gone ones.
+
+        Every recipe in ``keep`` counts as seen today. A remembered recipe is
+        forgotten only when it has been in no list for more than 30 days
+        (:data:`FORGET_RECIPE_AFTER`). An empty list forgets nothing: it may
+        be a broken answer.
+        """
+        wanted = {str(int(kitchenowl_id)) for kitchenowl_id in keep}
+        if not wanted:
+            _LOGGER.debug("Empty recipe list: no remembered recipe is forgotten")
+            return
+        today = _today()
+        limit = (dt_util.now().date() - FORGET_RECIPE_AFTER).isoformat()
+        changed = False
+        for key in list(self._ingredients):
+            if key not in self._ingredient_meta:
+                self._ingredient_meta[key] = IngredientMeta(seen=today)
+                changed = True
+            meta = self._ingredient_meta[key]
+            if key in wanted:
+                if meta.get("seen") != today:
+                    meta["seen"] = today
+                    changed = True
+            elif meta.get("seen", today) < limit:
+                del self._ingredients[key]
+                self._ingredient_meta.pop(key, None)
+                changed = True
+        if changed:
+            self._schedule_save()
 
     # ----- shopping list of a week --------------------------------------
 
@@ -470,6 +707,62 @@ def _older_than(value: str, limit: datetime) -> bool:
     if when.tzinfo is None:
         when = when.replace(tzinfo=dt_util.UTC)
     return when < limit
+
+
+def _remembered_item(value: Any, keep_unknown: bool = False) -> RememberedItem | None:
+    """Return a remembered ingredient if it has the right shape.
+
+    With ``keep_unknown`` a ``description`` or ``optional`` of None stays
+    None (unknown, see :func:`merge_items`); otherwise it becomes ``""`` or
+    False.
+    """
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not " ".join(name.split()):
+        return None
+    item_id = value.get("id")
+    description = value.get("description")
+    optional = value.get("optional")
+    return {
+        "id": item_id
+        if isinstance(item_id, int) and not isinstance(item_id, bool)
+        else None,
+        "name": " ".join(name.split())[:MAX_ITEM_NAME],
+        "description": None  # type: ignore[typeddict-item]
+        if keep_unknown and description is None
+        else description
+        if isinstance(description, str)
+        else "",
+        "optional": None  # type: ignore[typeddict-item]
+        if keep_unknown and optional is None
+        else optional is True,
+    }
+
+
+def _today() -> str:
+    """Return today's local date as ``YYYY-MM-DD``."""
+    return dt_util.now().date().isoformat()
+
+
+def _created_at(value: Any) -> int | None:
+    """Return a KitchenOwl creation time (milliseconds) or None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _ingredient_meta(value: Any) -> IngredientMeta:
+    """Return the stored meta of a remembered recipe; broken parts dropped."""
+    meta = IngredientMeta()
+    if not isinstance(value, dict):
+        return meta
+    seen = value.get("seen")
+    if _is_iso_date(seen):
+        meta["seen"] = seen
+    if (created := _created_at(value.get("created_at"))) is not None:
+        meta["created_at"] = created
+    return meta
 
 
 def _picnic_product(value: Any) -> PicnicProduct | None:

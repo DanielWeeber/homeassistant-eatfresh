@@ -99,13 +99,14 @@ async def test_get(source: ChefkochSource, mock: aioresponses) -> None:
     ]
     assert recipe.tags == ["Hauptspeise", "Eintopf"]
     assert [(i.amount, i.unit, i.name, i.note) for i in recipe.ingredients] == [
-        (1.0, "kg", "Kartoffel", "mehlig kochend"),
+        (1.0, "kg", "Kartoffeln", "mehlig kochend"),
         (1.0, "Bund", "Suppengemüse", None),
         (1.5, "l", "Brühe", None),
-        (None, None, "Salz und Pfeffer", None),
+        (None, None, "Salz", None),
+        (None, None, "Pfeffer", None),
         (2.0, None, "Würstchen", None),
     ]
-    assert recipe.ingredients[0].raw == "1 kg Kartoffel, mehlig kochend"
+    assert recipe.ingredients[0].raw == "1 kg Kartoffeln, mehlig kochend"
     assert recipe.ingredients[2].raw == "1,5 Liter Brühe"
 
 

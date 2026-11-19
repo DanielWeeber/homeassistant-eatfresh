@@ -66,7 +66,7 @@ async def test_upgrade_from_0_3_0_keeps_everything(
     _product(store, "Milch", "s1")
     await _save(hass)
     saved = hass_storage[STORAGE_KEY]
-    assert saved["minor_version"] == 3
+    assert saved["minor_version"] == 4
     for key, value in old.items():
         assert saved["data"][key] == value
     assert saved["data"]["picnic_map"]["milch"]["product_id"] == "s1"

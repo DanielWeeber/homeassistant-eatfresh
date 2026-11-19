@@ -261,6 +261,11 @@ async def test_list_recipes(client, mock):
             "yields": 4,
             "tags": ["Backen", "Süß"],
             "items": ["Mehl"],
+            # No "optional" in the answer: unknown (the memory keeps its value).
+            "item_rows": [
+                {"id": 1, "name": "Mehl", "description": "500 g", "optional": None}
+            ],
+            "created_at": None,
         }
     ]
 
