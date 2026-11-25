@@ -47,7 +47,7 @@ async def test_week_to_list_at_the_same_time_sends_once(
 ) -> None:
     mock_client.list_planner.return_value = plan((11, "Soup", date(2026, 11, 16)))
 
-    async def slow_add(list_id: int, recipe_id: int) -> int:
+    async def slow_add(list_id: int, recipe_id: int, **_kwargs: Any) -> int:
         for _ in range(5):
             await asyncio.sleep(0)
         return 3
@@ -86,7 +86,7 @@ async def test_week_lock_is_released_after_an_error(
     # Cancelled while sending: the lock is gone as well.
     started = asyncio.Event()
 
-    async def hang(list_id: int, recipe_id: int) -> int:
+    async def hang(list_id: int, recipe_id: int, **_kwargs: Any) -> int:
         started.set()
         await asyncio.Event().wait()
         return 0

@@ -14,8 +14,8 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
-from aioresponses import aioresponses
 import pytest
+from aioresponses import aioresponses
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -250,6 +250,30 @@ def mock_client() -> MagicMock:
         return ids
 
     client.recipe_ids = AsyncMock(side_effect=recipe_ids)
+
+    async def recipe_summary(household_id: int, recipe_id: int) -> dict | None:
+        # Like the real client: one recipe of the (cached) recipe list.
+        for item in client.list_recipes.return_value:
+            if int(item["id"]) == int(recipe_id):
+                return dict(item)
+        return None
+
+    client.recipe_summary = AsyncMock(side_effect=recipe_summary)
+    # 0.5.0, shopping: categories and entries of the list.
+    client.list_categories = AsyncMock(return_value=[])
+    client.create_category = AsyncMock(
+        side_effect=lambda household_id, name: {
+            "id": 90,
+            "name": name,
+            "default_key": None,
+        }
+    )
+    client.set_item_category = AsyncMock(return_value=None)
+    client.remove_from_shoppinglist = AsyncMock(return_value=None)
+    client.add_item_to_shoppinglist = AsyncMock(return_value=None)
+    client.get_item = AsyncMock(
+        side_effect=lambda item_id: {"id": item_id, "name": "Item", "category": None}
+    )
     return client
 
 
@@ -262,9 +286,7 @@ def mock_sources() -> Generator[MagicMock]:
         patch("custom_components.eatfresh.build_sources", build),
         patch("custom_components.eatfresh.config_flow.SOURCE_CLASSES", FAKE_CLASSES),
         patch("custom_components.eatfresh.sources.SOURCE_CLASSES", FAKE_CLASSES),
-        patch(
-            "custom_components.eatfresh.sources.source_for_url", fake_source_for_url
-        ),
+        patch("custom_components.eatfresh.sources.source_for_url", fake_source_for_url),
     ):
         yield build
 

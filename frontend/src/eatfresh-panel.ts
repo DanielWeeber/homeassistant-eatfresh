@@ -10,6 +10,7 @@ import {
   mdiCartPlus,
   mdiCheck,
   mdiCheckCircleOutline,
+  mdiChevronDown,
   mdiChevronLeft,
   mdiChevronRight,
   mdiClockOutline,
@@ -28,6 +29,7 @@ import {
   mdiOpenInNew,
   mdiPlus,
   mdiRefresh,
+  mdiShapeOutline,
   mdiSilverwareForkKnife,
   mdiStorefrontOutline,
   mdiSwapHorizontal,
@@ -37,6 +39,7 @@ import {
 import { LitElement, html, nothing, svg, type PropertyValues, type TemplateResult } from "lit";
 import { property, query, state } from "lit/decorators.js";
 import { live } from "lit/directives/live.js";
+import { repeat } from "lit/directives/repeat.js";
 import { pickLang, translate, type Lang, type StringKey } from "./i18n";
 import { panelStyles } from "./styles";
 import type {
@@ -46,13 +49,17 @@ import type {
   CollectionRestoreResponse,
   HomeAssistant,
   PanelRoute,
+  PicnicHit,
   PicnicProduct,
   PicnicSendResponse,
+  Portions,
   PlannerEntry,
   PlannerResponse,
   Recipe,
   RecipeResponse,
   SearchHit,
+  ShopDepartment,
+  ShopDone,
   ShoppingItem,
   ShoppingResponse,
   SourceErrorInfo,
@@ -66,6 +73,7 @@ import type {
 import {
   addDays,
   errorText,
+  planErrorCode,
   formatDay,
   formatMinutes,
   formatPrice,
@@ -73,9 +81,12 @@ import {
   hostOf,
   ingredientQty,
   isHttpUrl,
+  localNumber,
+  localQty,
   mondayOf,
   parsePath,
   picnicText,
+  relativeDay,
   today,
   viewPath,
   weekdayName,
@@ -109,7 +120,7 @@ type Dialog =
       busy: boolean;
       error: string;
     }
-  | { kind: "plan"; id: number; name: string; image: string | null }
+  | { kind: "plan"; id: number; name: string; image: string | null; servings?: number }
   | { kind: "pick"; date: string }
   | { kind: "week_again"; week: string; at: string }
   | {
@@ -118,10 +129,14 @@ type Dialog =
       name: string;
       query: string;
       state: Load;
-      products: PicnicProduct[];
+      products: PicnicHit[];
       error: string;
+      /** Set when the person picks a smaller package for the rest (0.5.0). */
+      small?: { rest: string | null; main: string | null };
     }
   | { kind: "item_menu"; item_id: number }
+  /** Choose the group of a shopping list entry (0.5.0). */
+  | { kind: "department"; item_id: number }
   | { kind: "send"; n: number }
   | { kind: "forget_missing"; id: number };
 
@@ -135,6 +150,17 @@ const LIST_CODES = new Set(["twice", "not_on_list", "already_sent"]);
 const SEND_MAX = 60;
 const AMOUNT_MAX = 20;
 const AMOUNT_SAVE_MS = 700;
+/** After the last tick or untick call is back, the list is read again once (0.5.0). */
+const SHOP_RELOAD_MS = 600;
+/** Servings (0.5.0): limits, and the pause before the core is asked after a burst of taps. */
+const SERVINGS_MIN = 1;
+const SERVINGS_MAX = 99;
+const KO_SERVINGS_MS = 250;
+const PLAN_SERVINGS_MS = 400;
+/** `rest` and `main_unit_quantity` of `eatfresh/picnic/search`: at most 30 characters. */
+const REST_MAX = 30;
+
+const clampServings = (n: number) => Math.min(SERVINGS_MAX, Math.max(SERVINGS_MIN, Math.round(n)));
 
 const icon = (path: string, cls = "i") =>
   html`<svg class=${cls} viewBox="0 0 24 24" aria-hidden="true">${svg`<path d=${path}></path>`}</svg>`;
@@ -229,11 +255,30 @@ export class EatFreshPanel extends LitElement {
   @state() private _shopLoading = false;
   /** Entries the user unticked (everything with a product is ticked by default). */
   @state() private _unpicked = new Set<number>();
+  /** Entries with `cart_hint` (0.5.0) go only when ticked by hand: part of them is in the cart already. */
+  @state() private _hintPicked = new Set<number>();
   @state() private _itemBusy = new Set<number>();
   @state() private _itemErrors = new Map<number, string>();
   @state() private _showSkipped = false;
   @state() private _sending = false;
   @state() private _sendNotice?: { kind: "partial" | "error"; text: string };
+  /** The "Done" part of the shopping list is open (0.5.0). */
+  @state() private _doneOpen = false;
+  /**
+   * Entries ticked off in the panel (0.5.0): hidden from the list at once. `seq` is the list load that
+   * followed the core's yes; a load started after it shows the truth, then the entry goes from here.
+   */
+  @state() private _pendingDone = new Map<number, { entry: ShopDone; seq?: number }>();
+  /** Ticked-off entries put back on the list in the panel, shown open until the list is read again. */
+  @state() private _pendingBack = new Map<number, { entry: ShopDone; seq?: number }>();
+  /** Short text for screen readers after ticking off or putting back. */
+  @state() private _shopAnnounce = "";
+  /** Servings shown in the open recipe of the collection; the core's answer follows (0.5.0). */
+  @state() private _koServings?: number;
+  /** True while a changed number of servings waits for the core: the ingredients still show the old amounts. */
+  @state() private _koServingsBusy = false;
+  /** Servings of week plan entries changed a moment ago, by "<id>|<date>", until the core has them. */
+  @state() private _planServings = new Map<string, number>();
 
   @query("dialog") private _dialogEl?: HTMLDialogElement;
 
@@ -248,6 +293,9 @@ export class EatFreshPanel extends LitElement {
   private _collectionSeq = 0;
   private _plannerSeq = 0;
   private _toastTimer?: number;
+  /** Tick or untick calls on their way; the list is read again once when all are back. */
+  private _shopOps = 0;
+  private _shopReloadTimer?: number;
   private _resize?: ResizeObserver;
   private _navigatedInside = false;
   /** Link whose recipe is saved by itself once it has loaded (set only by the link dialog and the search field). */
@@ -264,6 +312,11 @@ export class EatFreshPanel extends LitElement {
   private _productSeq = 0;
   private _pendingAmounts = new Map<string, number>();
   private _amountTimers = new Map<string, number>();
+  /** Pieces of the smaller package changed in the panel, by ingredient name; the core has no call to keep them. */
+  private _smallAmounts = new Map<string, number>();
+  private _koServingsTimer?: number;
+  private _planTimers = new Map<string, number>();
+  private _planInflight = new Set<string>();
 
   get hass(): HomeAssistant | undefined {
     return this._hass;
@@ -297,9 +350,17 @@ export class EatFreshPanel extends LitElement {
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    window.clearTimeout(this._shopReloadTimer);
     window.removeEventListener("popstate", this._onPopState);
     this._resize?.disconnect();
     this._clearToast();
+    this._cancelKoServings();
+    // Servings of plan entries that still wait are sent now, like the quantities below.
+    for (const [key, timer] of this._planTimers) {
+      window.clearTimeout(timer);
+      const [id, date] = key.split("|");
+      void this._savePlanServings(Number(id), date);
+    }
     // Save quantities that are still waiting.
     for (const [key, timer] of this._amountTimers) {
       window.clearTimeout(timer);
@@ -384,6 +445,8 @@ export class EatFreshPanel extends LitElement {
       this._viewEpoch++;
       // The lock of the missing-ingredient buttons belongs to the recipe that was open.
       this._koMissingBusy = false;
+      // A number of servings still waiting belongs to the recipe that was open.
+      this._cancelKoServings();
       // A hint belongs to the view it came from; do not carry it along.
       this._clearToast();
       this._autoSaveUrl = undefined;
@@ -395,7 +458,14 @@ export class EatFreshPanel extends LitElement {
     else if (view.name === "korecipe" && this._tab === "search") this._tab = "collection";
     if (!this._hass) return;
     if (view.name === "recipe") this._loadRecipe(view);
-    if (view.name === "korecipe") this._loadKoRecipe(view.id);
+    if (view.name === "korecipe") {
+      // Nothing is remembered: a recipe opens again with its start value, or with the number of the plan entry.
+      const p = this._ko?.kitchenowl_id === view.id ? this._ko.portions : undefined;
+      const want = view.servings ?? p?.start ?? undefined;
+      const reset = changed && !!p?.scalable && want != null && p.servings !== want;
+      if (changed && !reset && this._ko && p) this._koServings = this._shownServings(this._ko);
+      this._loadKoRecipe(view.id, reset, view.servings);
+    }
     if (view.name === "collection" && (this._collectionStale || this._collectionState === "error"))
       this._loadCollection();
     if (view.name === "planner" && (this._plannerStale || this._plannerState === "error")) this._loadPlanner();
@@ -538,19 +608,23 @@ export class EatFreshPanel extends LitElement {
     }
   }
 
-  private async _loadKoRecipe(id: number, force = false): Promise<void> {
+  private async _loadKoRecipe(id: number, force = false, servings?: number): Promise<void> {
     if (!force && id === this._koFor && this._koState !== "error") return;
     this._koFor = id;
     const seq = ++this._koSeq;
+    this._cancelKoServings();
     this._ko = undefined;
+    this._koServings = undefined;
     this._koState = "loading";
     try {
       const res = await this._ws<CollectionRecipeResponse>({
         type: "eatfresh/collection/recipe",
         kitchenowl_id: id,
+        ...(servings != null ? { servings: clampServings(servings) } : {}),
       });
       if (seq !== this._koSeq) return;
       this._ko = res;
+      this._koServings = this._shownServings(res);
       this._koState = "done";
     } catch (err) {
       if (seq !== this._koSeq) return;
@@ -615,14 +689,162 @@ export class EatFreshPanel extends LitElement {
    */
   private async _refreshKo(id: number, epoch: number): Promise<boolean> {
     const seq = this._koSeq;
-    const res = await this._ws<CollectionRecipeResponse>({ type: "eatfresh/collection/recipe", kitchenowl_id: id });
+    // Keep the servings that are shown.
+    const servings = this._ko?.kitchenowl_id === id && this._ko.portions?.scalable ? this._koServings : undefined;
+    const res = await this._ws<CollectionRecipeResponse>({
+      type: "eatfresh/collection/recipe",
+      kitchenowl_id: id,
+      ...(servings != null ? { servings } : {}),
+    });
     if (seq !== this._koSeq || !this._koStillShown(id, epoch)) return false;
     this._ko = res;
+    this._koServings = this._shownServings(res);
     this._koFor = id;
     this._koState = "done";
     const n = res.missing?.length;
     if (n != null) this._patchRecipe(id, { missing: n });
     return true;
+  }
+
+  // ---- servings (0.5.0): the core scales, the panel only shows its answer
+
+  /** The number the recipe shows: `portions.servings` when the core can scale it, else none (no counter). */
+  private _shownServings(res: CollectionRecipeResponse | undefined): number | undefined {
+    const p: Portions | undefined = res?.portions;
+    if (!p?.scalable) return undefined;
+    return p.servings ?? p.start ?? undefined;
+  }
+
+  private _cancelKoServings(): void {
+    window.clearTimeout(this._koServingsTimer);
+    this._koServingsTimer = undefined;
+    this._koServingsBusy = false;
+  }
+
+  /** − and + in a recipe of the collection: the number changes at once, the core is asked a moment later. */
+  private _stepKoServings(delta: number): void {
+    const data = this._ko;
+    const now = this._koServings;
+    if (!data?.portions?.scalable || now == null || this._koState !== "done") return;
+    const next = clampServings(now + delta);
+    if (next === now) return;
+    this._koServings = next;
+    this._koServingsBusy = true;
+    // An answer still on its way is for an old number: it is dropped.
+    this._koSeq++;
+    window.clearTimeout(this._koServingsTimer);
+    const id = data.kitchenowl_id;
+    const epoch = this._viewEpoch;
+    this._koServingsTimer = window.setTimeout(() => void this._fetchKoServings(id, next, epoch), KO_SERVINGS_MS);
+  }
+
+  private async _fetchKoServings(id: number, servings: number, epoch: number): Promise<void> {
+    this._koServingsTimer = undefined;
+    if (!this._koStillShown(id, epoch)) return;
+    const seq = ++this._koSeq;
+    try {
+      const res = await this._ws<CollectionRecipeResponse>({
+        type: "eatfresh/collection/recipe",
+        kitchenowl_id: id,
+        servings,
+      });
+      if (seq !== this._koSeq || !this._koStillShown(id, epoch)) return;
+      this._ko = res;
+      this._koServings = this._shownServings(res);
+      this._koServingsBusy = false;
+      const n = res.missing?.length;
+      if (n != null) this._patchRecipe(id, { missing: n });
+    } catch (err) {
+      if (seq !== this._koSeq || !this._koStillShown(id, epoch)) return;
+      // Back to the number whose amounts are shown.
+      this._koServings = this._shownServings(this._ko);
+      this._koServingsBusy = false;
+      this._showToast(this._t("portions_failed", { message: this._err(err) }), "error");
+    }
+  }
+
+  private _planKey(id: number, date: string): string {
+    return `${id}|${date}`;
+  }
+
+  /** Servings shown for a plan entry: a number changed a moment ago, else the core's. */
+  private _entryServings(e: PlannerEntry, date: string | null): number | null {
+    if (!date) return null;
+    return this._planServings.get(this._planKey(e.kitchenowl_id, date)) ?? e.servings ?? null;
+  }
+
+  private _setPlanPending(key: string, value: number | undefined): void {
+    const next = new Map(this._planServings);
+    if (value == null) next.delete(key);
+    else next.set(key, value);
+    this._planServings = next;
+  }
+
+  /** − and + at a plan entry: the number changes at once and is saved a moment later. */
+  private _stepPlanServings(e: PlannerEntry, date: string, delta: number): void {
+    const now = this._entryServings(e, date);
+    if (now == null) return;
+    const next = clampServings(now + delta);
+    if (next === now) return;
+    const key = this._planKey(e.kitchenowl_id, date);
+    this._setPlanPending(key, next);
+    window.clearTimeout(this._planTimers.get(key));
+    this._planTimers.set(
+      key,
+      window.setTimeout(() => void this._savePlanServings(e.kitchenowl_id, date), PLAN_SERVINGS_MS),
+    );
+  }
+
+  /** One call per burst of taps, never two at once for the same entry: the last number wins. */
+  private async _savePlanServings(id: number, date: string): Promise<void> {
+    const key = this._planKey(id, date);
+    this._planTimers.delete(key);
+    // A call is on its way: this number goes once it is answered.
+    if (this._planInflight.has(key)) return;
+    const want = this._planServings.get(key);
+    if (want == null) return;
+    this._planInflight.add(key);
+    let ok = false;
+    try {
+      await this._ws({ type: "eatfresh/planner/set_servings", kitchenowl_id: id, date, servings: want });
+      ok = true;
+      this._plannerPatch((p) => ({
+        ...p,
+        days: p.days.map((d) =>
+          d.date === date
+            ? { ...d, entries: d.entries.map((e) => (e.kitchenowl_id === id ? { ...e, servings: want } : e)) }
+            : d,
+        ),
+      }));
+      if (this._planServings.get(key) === want) this._setPlanPending(key, undefined);
+      const listed = this._planner?.days.some((d) => d.date === date) && !!this._planner.shopping_list_at;
+      if (listed) this._showToast(this._t("plan_servings_listed"), "ok", { ms: UNDO_MS });
+    } catch (err) {
+      // Back to the number the core has.
+      window.clearTimeout(this._planTimers.get(key));
+      this._planTimers.delete(key);
+      this._setPlanPending(key, undefined);
+      // The two codes of set_servings (0.5.0) speak for themselves, without the general lead.
+      const code = planErrorCode(err);
+      this._showToast(code ? this._err(err) : this._t("plan_servings_failed", { message: this._err(err) }), "error");
+      // The entry is gone in KitchenOwl: read the week again, so it is not shown any longer.
+      if (code === "plan_entry_lost") {
+        this._plannerStale = true;
+        if (this._view.name === "planner") void this._loadPlanner();
+      }
+    } finally {
+      this._planInflight.delete(key);
+    }
+    if (this._planServings.has(key)) {
+      // Tapped again while the call was on its way, and the pause is over.
+      if (!this._planTimers.has(key)) void this._savePlanServings(id, date);
+      return;
+    }
+    if (ok) {
+      // Read the week again, quietly (the view stays as it is).
+      this._plannerStale = true;
+      if (this._view.name === "planner") void this._loadPlanner();
+    }
   }
 
   private async _loadCollection(): Promise<void> {
@@ -848,13 +1070,15 @@ export class EatFreshPanel extends LitElement {
     return Number(e.translation_placeholders?.added_recipes ?? 0);
   }
 
-  private async _addToShopping(ids: number[]): Promise<void> {
+  /** `servings`: the number chosen in the open recipe (0.5.0); without it the core takes the start value. */
+  private async _addToShopping(ids: number[], servings?: number): Promise<void> {
     if (!ids.length || this._shoppingBusy) return;
     this._shoppingBusy = true;
     try {
       const res = await this._ws<{ added: number }>({
         type: "eatfresh/shopping_list/add",
         kitchenowl_ids: ids,
+        ...(servings != null ? { servings: clampServings(servings) } : {}),
       });
       const n = res.added ?? 0;
       this._showToast(
@@ -1068,8 +1292,8 @@ export class EatFreshPanel extends LitElement {
 
   // ---- week plan
 
-  private _openPlan(id: number, name: string, image: string | null): void {
-    this._dialog = { kind: "plan", id, name, image };
+  private _openPlan(id: number, name: string, image: string | null, servings?: number): void {
+    this._dialog = { kind: "plan", id, name, image, ...(servings != null ? { servings } : {}) };
     this._ensureToday();
   }
 
@@ -1101,10 +1325,17 @@ export class EatFreshPanel extends LitElement {
     this._dialog = undefined;
     this._insertEntry(date, entry);
     try {
-      await this._ws({ type: "eatfresh/planner/add", kitchenowl_id: entry.kitchenowl_id, date });
+      await this._ws({
+        type: "eatfresh/planner/add",
+        kitchenowl_id: entry.kitchenowl_id,
+        date,
+        ...(entry.servings != null ? { servings: clampServings(entry.servings) } : {}),
+      });
       // KitchenOwl replaces an entry without a day when the recipe gets a day.
       this._dropEntry(null, entry.kitchenowl_id);
       this._plannerStale = true;
+      // The core knows the servings of the new entry: read the week quietly when it is shown.
+      if (this._view.name === "planner" && entry.servings == null) void this._loadPlanner();
       if (undoable)
         this._showToast(this._t("planned", { name: entry.name, day: formatDay(this._lang, date) }), "ok", {
           action: { label: this._t("undo"), run: () => this._unplan(entry, date, false) },
@@ -1181,10 +1412,18 @@ export class EatFreshPanel extends LitElement {
       if (seq !== this._shopSeq) return;
       // Quantities typed a moment ago win over the stored ones until they are saved.
       const items = res.items.map((i) => {
-        const pending = this._pendingAmounts.get(lower(i.name));
-        return pending != null && i.product ? { ...i, amount: pending } : i;
+        const key = lower(i.name);
+        const pending = this._pendingAmounts.get(key);
+        let item = pending != null && i.product ? { ...i, amount: pending } : i;
+        // Pieces of the smaller package set in the panel (0.5.0); a sent entry keeps what is in the cart.
+        const small = this._smallAmounts.get(key);
+        if (small != null && item.small && !item.sent_at) item = { ...item, small_amount: small };
+        // 0 of the main product only with at least one smaller package.
+        if (item.product && !item.sent_at && item.amount < 1 && this._smallCount(item) < 1) item = { ...item, amount: 1 };
+        return item;
       });
       this._shop = { ...res, items };
+      this._prunePending(seq);
       this._shopState = "done";
       this._shopStale = false;
       const open = new Set(items.filter((i) => !i.sent_at && !i.skip).map((i) => i.item_id));
@@ -1200,7 +1439,20 @@ export class EatFreshPanel extends LitElement {
   }
 
   private _isPicked(item: ShoppingItem): boolean {
-    return !!item.product && !item.skip && !item.sent_at && !this._unpicked.has(item.item_id);
+    return (
+      !!item.product &&
+      !item.skip &&
+      !item.sent_at &&
+      !this._unpicked.has(item.item_id) &&
+      (!item.cart_hint || this._hintPicked.has(item.item_id)) &&
+      !this._pendingDone.has(item.item_id) &&
+      item.amount + this._smallCount(item) >= 1
+    );
+  }
+
+  /** Pieces of the smaller package (0.5.0); 0 without one or on an older integration. */
+  private _smallCount(item: ShoppingItem): number {
+    return item.small ? Math.max(0, item.small_amount ?? 0) : 0;
   }
 
   private get _pickedItems(): ShoppingItem[] {
@@ -1220,8 +1472,8 @@ export class EatFreshPanel extends LitElement {
       items: this._shop.items.map((i) => {
         if (lower(i.name) !== key) return i;
         // A sent entry keeps the quantity that is in the cart (and that "undo" takes out).
-        if (i.sent_at && "amount" in patch) {
-          const { amount: _ignored, ...rest } = patch;
+        if (i.sent_at && ("amount" in patch || "small_amount" in patch)) {
+          const { amount: _ignored, small_amount: _small, ...rest } = patch;
           return { ...i, ...rest };
         }
         return { ...i, ...patch };
@@ -1239,6 +1491,10 @@ export class EatFreshPanel extends LitElement {
     if (on) next.delete(id);
     else next.add(id);
     this._unpicked = next;
+    const hint = new Set(this._hintPicked);
+    if (on) hint.add(id);
+    else hint.delete(id);
+    this._hintPicked = hint;
   }
 
   private _setItemBusy(id: number, on: boolean): void {
@@ -1255,7 +1511,7 @@ export class EatFreshPanel extends LitElement {
     this._itemErrors = next;
   }
 
-  private _openProduct(item: ShoppingItem): void {
+  private _openProduct(item: ShoppingItem, small = false): void {
     this._productSeq++;
     this._dialog = {
       kind: "product",
@@ -1265,6 +1521,7 @@ export class EatFreshPanel extends LitElement {
       state: "idle",
       products: [],
       error: "",
+      ...(small ? { small: { rest: item.rest ?? null, main: item.product?.unit_quantity ?? null } } : {}),
     };
   }
 
@@ -1276,11 +1533,22 @@ export class EatFreshPanel extends LitElement {
     if (!query) return;
     const seq = ++this._productSeq;
     this._dialog = { ...d, state: "loading", error: "" };
+    // For a smaller package the core marks the hits that cover the rest (0.5.0).
+    const rest = d.small?.rest?.trim().slice(0, REST_MAX);
+    const main = d.small?.main?.trim().slice(0, REST_MAX);
     try {
-      const res = await this._ws<{ products: PicnicProduct[] }>({ type: "eatfresh/picnic/search", query });
+      const res = await this._ws<{ products: PicnicHit[] }>({
+        type: "eatfresh/picnic/search",
+        query,
+        ...(d.small && rest ? { rest } : {}),
+        ...(d.small && main ? { main_unit_quantity: main } : {}),
+      });
       const now = this._dialog;
       if (seq !== this._productSeq || now?.kind !== "product") return;
-      this._dialog = { ...now, state: "done", products: res.products ?? [] };
+      let products = res.products ?? [];
+      // Hits that cover the rest come first, otherwise in the order of Picnic.
+      if (now.small) products = [...products.filter((p) => p.fits_rest), ...products.filter((p) => !p.fits_rest)];
+      this._dialog = { ...now, state: "done", products };
     } catch (err) {
       const now = this._dialog;
       if (seq !== this._productSeq || now?.kind !== "product") return;
@@ -1358,7 +1626,9 @@ export class EatFreshPanel extends LitElement {
   /** Quantity changes show at once and are saved a moment later (one call per burst of taps). */
   private _setAmount(item: ShoppingItem, amount: number): void {
     if (!item.product) return;
-    const value = Math.min(AMOUNT_MAX, Math.max(1, Math.round(amount)));
+    // 0 only while at least one smaller package goes along (0.5.0).
+    const min = this._smallCount(item) >= 1 ? 0 : 1;
+    const value = Math.min(AMOUNT_MAX, Math.max(min, Math.round(amount)));
     const key = lower(item.name);
     this._patchByName(item.name, { amount: value });
     this._pendingAmounts.set(key, value);
@@ -1375,12 +1645,57 @@ export class EatFreshPanel extends LitElement {
     const amount = this._pendingAmounts.get(key);
     const product = this._shop?.items.find((i) => lower(i.name) === key)?.product;
     if (amount == null || !product) return;
+    // `eatfresh/picnic/map` keeps 1 to 20; a 0 next to a smaller package stays in the panel until it is sent.
+    if (amount < 1) return;
     try {
       await this._ws({ type: "eatfresh/picnic/map", name, product, amount });
     } catch (err) {
       this._showToast(this._t("amount_failed", { message: this._err(err) }), "error");
     } finally {
       if (this._pendingAmounts.get(key) === amount) this._pendingAmounts.delete(key);
+    }
+  }
+
+  /** Pieces of the smaller package (0.5.0): shown at once and sent with the entry, not saved by themselves. */
+  private _setSmallAmount(item: ShoppingItem, amount: number): void {
+    if (!item.small || item.sent_at) return;
+    const min = item.amount >= 1 ? 0 : 1;
+    const value = Math.min(AMOUNT_MAX, Math.max(min, Math.round(amount)));
+    this._smallAmounts.set(lower(item.name), value);
+    this._patchByName(item.name, { small_amount: value });
+  }
+
+  /** Remember (or with null forget) a smaller package for the rest, then read the list again. */
+  private async _mapSmall(item: ShoppingItem, product: PicnicProduct | null): Promise<void> {
+    if (this._dialog?.kind === "product") this._dialog = undefined;
+    const key = lower(item.name);
+    const before = this._item(item.item_id) ?? item;
+    const old: Partial<ShoppingItem> = { small: before.small ?? null, small_amount: before.small_amount ?? 0, amount: before.amount };
+    const oldSmall = this._smallAmounts.get(key);
+    this._smallAmounts.delete(key);
+    const small = product
+      ? { id: product.id, name: product.name, unit_quantity: product.unit_quantity, price: product.price }
+      : null;
+    // Without a smaller package the main product needs at least one piece again.
+    if (!small && before.amount < 1) this._pendingAmounts.delete(key);
+    this._patchByName(item.name, {
+      small,
+      small_amount: small ? before.small_amount ?? 0 : 0,
+      ...(!small && before.amount < 1 ? { amount: 1 } : {}),
+    });
+    this._clearItemError(item.item_id);
+    try {
+      await this._ws({ type: "eatfresh/picnic/map_small", name: item.name, product: small });
+      this._showToast(
+        small ? this._t("small_mapped", { name: item.name, product: small.name }) : this._t("small_removed", { name: item.name }),
+        "ok",
+      );
+      // The core splits the amount again (store only, no call to Picnic).
+      void this._loadShopping(true);
+    } catch (err) {
+      this._patchByName(item.name, old);
+      if (oldSmall != null) this._smallAmounts.set(key, oldSmall);
+      this._showToast(this._t(small ? "small_failed" : "small_remove_failed", { message: this._err(err) }), "error");
     }
   }
 
@@ -1416,7 +1731,11 @@ export class EatFreshPanel extends LitElement {
       try {
         const res = await this._ws<PicnicSendResponse>({
           type: "eatfresh/picnic/send",
-          items: chunk.map((c) => ({ item_id: c.item_id, product_id: c.product!.id, amount: c.amount })),
+          items: chunk.map((c) => {
+            // The smaller package itself comes from the store; the panel sends only its pieces (0.5.0).
+            const small = this._smallCount(c);
+            return { item_id: c.item_id, product_id: c.product!.id, amount: c.amount, ...(small ? { small_amount: small } : {}) };
+          }),
         });
         sent.push(...(res.sent ?? []));
         failed.push(...(res.failed ?? []));
@@ -1429,24 +1748,48 @@ export class EatFreshPanel extends LitElement {
     }
     const at = new Date().toISOString();
     const sentIds = new Set(sent.map((s) => s.item_id));
+    const sentSmall = new Map(sent.map((s) => [s.item_id, s.small_amount]));
     // Picnic did not answer in time: maybe in the cart. The core marked them,
     // so they are never sent again by themselves; show them as "maybe in the cart".
     const maybe = failed.filter((f) => f.code === "maybe_sent");
     const maybeIds = new Set(maybe.map((f) => f.item_id));
-    const other = failed.filter((f) => !maybeIds.has(f.item_id));
+    // The main product went in, the smaller package did not (0.5.0): the entry stays marked as sent.
+    const smallFailed = failed.filter((f) => sentIds.has(f.item_id) && !maybeIds.has(f.item_id));
+    const other = failed.filter((f) => !maybeIds.has(f.item_id) && !sentIds.has(f.item_id));
+    for (const f of smallFailed) this._smallAmounts.delete(lower(this._item(f.item_id)?.name ?? ""));
+    // Sent: a later `cart_hint` starts unticked again.
+    if (sentIds.size || maybeIds.size) this._hintPicked = new Set([...this._hintPicked].filter((id) => !sentIds.has(id) && !maybeIds.has(id)));
+    for (const id of [...sentIds, ...maybeIds]) {
+      const key = lower(this._item(id)?.name ?? "");
+      this._smallAmounts.delete(key);
+      // A main amount of 0 next to a smaller package is never saved by itself: after sending, the core's number counts.
+      const pend = this._pendingAmounts.get(key);
+      if (pend != null && pend < 1) {
+        this._pendingAmounts.delete(key);
+        window.clearTimeout(this._amountTimers.get(key));
+        this._amountTimers.delete(key);
+      }
+    }
     if (this._shop)
       this._shop = {
         ...this._shop,
         items: this._shop.items.map((i) =>
           sentIds.has(i.item_id)
-            ? { ...i, sent_at: at, sent_uncertain: false }
+            ? {
+                ...i,
+                sent_at: at,
+                sent_uncertain: false,
+                ...(sentSmall.get(i.item_id) != null ? { small_amount: sentSmall.get(i.item_id) } : {}),
+              }
             : maybeIds.has(i.item_id)
               ? { ...i, sent_at: at, sent_uncertain: true }
               : i,
         ),
       };
     // Messages of the core come as codes; the panel says them in its own language.
-    this._itemErrors = new Map(other.map((f) => [f.item_id, f.code ? picnicText(this._lang, f.code) : f.message]));
+    this._itemErrors = new Map(
+      [...other, ...smallFailed].map((f) => [f.item_id, f.code ? picnicText(this._lang, f.code) : f.message]),
+    );
     this._sending = false;
     const total = items.length;
     if (sent.length && !failed.length) {
@@ -1457,13 +1800,21 @@ export class EatFreshPanel extends LitElement {
         { ms: UNDO_MS, action: { label: this._t("undo"), run: () => void this._undoAll(ids) } },
       );
     } else if (sent.length || maybe.length) {
+      // Counted in entries; the first sentence already says that something is missing (0.5.0).
       const parts: string[] = [];
-      if (sent.length) parts.push(this._t("send_partial_head", { done: sent.length, total }));
+      const whole = sent.length - smallFailed.length;
+      parts.push(this._t(other.length || smallFailed.length ? "send_partial_lead" : "send_partial_lead_maybe"));
+      if (whole > 0)
+        parts.push(whole === 1 ? this._t("send_partial_head_one", { total }) : this._t("send_partial_head", { done: whole, total }));
       if (maybe.length)
         parts.push(maybe.length === 1 ? this._t("send_maybe_one") : this._t("send_maybe", { n: maybe.length }));
       if (other.length)
         parts.push(
           other.length === 1 ? this._t("send_partial_rest_one") : this._t("send_partial_rest", { failed: other.length }),
+        );
+      if (smallFailed.length)
+        parts.push(
+          smallFailed.length === 1 ? this._t("send_small_failed_one") : this._t("send_small_failed", { n: smallFailed.length }),
         );
       if (failed.some((f) => f.code === "not_tried")) parts.push(this._t("send_stopped"));
       this._sendNotice = { kind: "partial", text: parts.join(" ") };
@@ -1515,6 +1866,160 @@ export class EatFreshPanel extends LitElement {
       if (!(await this._undo(item, true))) return;
     }
     this._showToast(this._t("undo_all_done"), "ok");
+  }
+
+  // ---- ticking off and groups (0.5.0)
+
+  /** The core sorts into groups and can tick off (0.5.0). An older core: the list looks like before. */
+  private get _shopV5(): boolean {
+    return Array.isArray(this._shop?.departments);
+  }
+
+  /** Group of an entry; an unknown or missing key goes under the last group, so nothing gets lost. */
+  private _deptOf(item: { department?: string }): string {
+    const deps = this._shop?.departments ?? [];
+    const key = item.department;
+    if (key && deps.some((d) => d.key === key)) return key;
+    return deps.at(-1)?.key ?? "";
+  }
+
+  /** After a list load that started after the core's yes, the list itself shows the truth. */
+  private _prunePending(seq: number): void {
+    const keep = (m: Map<number, { entry: ShopDone; seq?: number }>) => {
+      const next = new Map([...m].filter(([, p]) => p.seq == null || seq <= p.seq));
+      return next.size === m.size ? m : next;
+    };
+    this._pendingDone = keep(this._pendingDone);
+    this._pendingBack = keep(this._pendingBack);
+  }
+
+  private _shopOpStart(): void {
+    this._shopOps++;
+    window.clearTimeout(this._shopReloadTimer);
+    this._shopReloadTimer = undefined;
+  }
+
+  /** When the last call is back, read the list once, quietly. */
+  private _shopOpEnd(): void {
+    this._shopOps = Math.max(0, this._shopOps - 1);
+    if (this._shopOps) return;
+    window.clearTimeout(this._shopReloadTimer);
+    this._shopReloadTimer = window.setTimeout(() => {
+      this._shopReloadTimer = undefined;
+      if (!this._shopOps && this.isConnected) void this._loadShopping(true);
+    }, SHOP_RELOAD_MS);
+  }
+
+  private _withoutKey<T>(m: Map<number, T>, id: number): Map<number, T> {
+    const next = new Map(m);
+    next.delete(id);
+    return next;
+  }
+
+  /** Keyboard and screen reader: focus moves to the next round button when an entry leaves the list. */
+  private _keepFocus(id: number): () => Promise<void> {
+    const root = this.renderRoot as ShadowRoot;
+    const buttons = [...root.querySelectorAll<HTMLElement>(".done-btn")];
+    const idx = buttons.findIndex((b) => b.closest("[data-item]")?.getAttribute("data-item") === String(id));
+    if (idx < 0 || root.activeElement !== buttons[idx]) return async () => {};
+    return async () => {
+      await this.updateComplete;
+      const now = [...root.querySelectorAll<HTMLElement>(".done-btn:not([disabled])")];
+      (now[Math.min(idx, now.length - 1)] ?? root.querySelector<HTMLElement>(".done-toggle"))?.focus();
+    };
+  }
+
+  /** Ticks an entry off: it goes to "Done" at once, the core takes it off the list; on an error it comes back. */
+  private async _check(item: ShoppingItem): Promise<void> {
+    const id = item.item_id;
+    if (this._pendingDone.has(id) || this._itemBusy.has(id)) return;
+    const back = this._pendingBack.get(id);
+    if (back && back.seq == null) return;
+    const entry: ShopDone = {
+      item_id: id,
+      name: item.name,
+      description: item.description,
+      department: this._deptOf(item),
+      at: new Date().toISOString(),
+    };
+    const focus = this._keepFocus(id);
+    this._pendingDone = new Map(this._pendingDone).set(id, { entry });
+    if (back) this._pendingBack = this._withoutKey(this._pendingBack, id);
+    this._clearItemError(id);
+    this._shopAnnounce = this._t("shop_checked", { name: item.name });
+    void focus();
+    this._setItemBusy(id, true);
+    this._shopOpStart();
+    try {
+      await this._ws({ type: "eatfresh/shopping/check", item_id: id });
+      const p = this._pendingDone.get(id);
+      if (p) this._pendingDone = new Map(this._pendingDone).set(id, { ...p, seq: this._shopSeq });
+    } catch (err) {
+      this._pendingDone = this._withoutKey(this._pendingDone, id);
+      // Ticked right after "back on the list": the entry stays where the core has it, on the list.
+      if (back) this._pendingBack = new Map(this._pendingBack).set(id, back);
+      this._shopAnnounce = "";
+      this._showToast(this._t("shop_check_failed", { name: item.name, message: this._err(err) }), "error");
+    } finally {
+      this._setItemBusy(id, false);
+      this._shopOpEnd();
+    }
+  }
+
+  /** Puts a ticked-off entry back on the list (the core adds it with the remembered quantity). */
+  private async _uncheck(entry: ShopDone): Promise<void> {
+    const id = entry.item_id;
+    if (this._itemBusy.has(id) || this._pendingBack.has(id)) return;
+    const done = this._pendingDone.get(id);
+    if (done && done.seq == null) return;
+    this._pendingBack = new Map(this._pendingBack).set(id, { entry });
+    if (done) this._pendingDone = this._withoutKey(this._pendingDone, id);
+    this._shopAnnounce = this._t("shop_unchecked", { name: entry.name });
+    this._setItemBusy(id, true);
+    this._shopOpStart();
+    try {
+      await this._ws({ type: "eatfresh/shopping/uncheck", item_id: id });
+      const p = this._pendingBack.get(id);
+      if (p) this._pendingBack = new Map(this._pendingBack).set(id, { ...p, seq: this._shopSeq });
+    } catch (err) {
+      this._pendingBack = this._withoutKey(this._pendingBack, id);
+      if (done) this._pendingDone = new Map(this._pendingDone).set(id, done);
+      this._shopAnnounce = "";
+      this._showToast(this._t("shop_uncheck_failed", { name: entry.name, message: this._err(err) }), "error");
+    } finally {
+      this._setItemBusy(id, false);
+      this._shopOpEnd();
+    }
+  }
+
+  /** Moves an entry into another group; the core remembers it per ingredient and writes it to KitchenOwl. */
+  private async _setDepartment(item: ShoppingItem, key: string): Promise<void> {
+    this._dialog = undefined;
+    if (key === this._deptOf(item)) return;
+    const old = item.department;
+    this._patchByName(item.name, { department: key });
+    this._shopOpStart();
+    try {
+      await this._ws({ type: "eatfresh/shopping/set_department", item_id: item.item_id, name: item.name, department: key });
+      const dept = this._shop?.departments?.find((d) => d.key === key)?.name ?? key;
+      this._showToast(this._t("dept_changed", { name: item.name, dept }), "ok");
+    } catch (err) {
+      this._patchByName(item.name, { department: old });
+      this._showToast(this._t("dept_failed", { message: this._err(err) }), "error");
+    } finally {
+      this._shopOpEnd();
+    }
+  }
+
+  /** Ticked-off entries: the panel's own first, then the core's, newest first, each once. */
+  private _doneEntries(): ShopDone[] {
+    const own = [...this._pendingDone.values()].map((p) => p.entry);
+    const ids = new Set(own.map((e) => e.item_id));
+    const all = [...own, ...(this._shop?.done ?? []).filter((e) => !ids.has(e.item_id))];
+    const seen = new Set<number>();
+    return all
+      .filter((e) => !this._pendingBack.has(e.item_id) && !seen.has(e.item_id) && seen.add(e.item_id))
+      .sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
   }
 
   // ---- toast
@@ -1852,6 +2357,71 @@ export class EatFreshPanel extends LitElement {
       : nothing;
   }
 
+  private _servingsText(n: number): string {
+    return n === 1 ? this._t("servings_one") : this._t("servings", { n });
+  }
+
+  /**
+   * A − n + counter. The limits lock the buttons with aria-disabled, so the
+   * keyboard focus stays on them; the number sits in a polite live region.
+   */
+  private _counter(
+    value: number,
+    min: number,
+    max: number,
+    labels: { group: string; less: string; more: string; text: string; sr?: string },
+    step: (delta: number) => void,
+    compact = false,
+  ): TemplateResult {
+    const btn = (delta: number, label: string, path: string, locked: boolean) =>
+      html`<button
+        type="button"
+        class="icon-btn"
+        aria-label=${label}
+        title=${label}
+        aria-disabled=${locked ? "true" : "false"}
+        @click=${() => {
+          if (!locked) step(delta);
+        }}
+      >
+        ${icon(path)}
+      </button>`;
+    return html`<div class="stepper counter ${compact ? "compact" : ""}" role="group" aria-label=${labels.group}>
+      ${btn(-1, labels.less, mdiMinus, value <= min)}
+      <output aria-live="polite" aria-atomic="true"
+        >${labels.text}${labels.sr ? html`<span class="sr"> ${labels.sr}</span>` : nothing}</output
+      >
+      ${btn(1, labels.more, mdiPlus, value >= max)}
+    </div>`;
+  }
+
+  /** Counter of the servings in a recipe of the collection, with the recipe's own number below when it differs. */
+  private _koPortions(data: CollectionRecipeResponse): { counter: TemplateResult; busy: boolean } | undefined {
+    const p = data.portions;
+    const n = this._koServings;
+    if (!p?.scalable || n == null) return undefined;
+    return {
+      busy: this._koServingsBusy,
+      counter: html`<div class="portions">
+        ${this._counter(
+          n,
+          SERVINGS_MIN,
+          SERVINGS_MAX,
+          {
+            group: this._t("portions_label"),
+            less: this._t("portions_less"),
+            more: this._t("portions_more"),
+            text: this._servingsText(n),
+          },
+          (delta) => this._stepKoServings(delta),
+        )}
+        ${p.base != null && p.base !== n
+          ? html`<span class="portions-base">${this._t(p.base === 1 ? "portions_in_recipe_one" : "portions_in_recipe", { n: p.base })}</span>`
+          : nothing}
+      </div>`,
+    };
+  }
+
   /**
    * Shared recipe layout. On a phone the title and the actions come first,
    * so the important buttons are on screen without scrolling.
@@ -1863,6 +2433,8 @@ export class EatFreshPanel extends LitElement {
     extra: TemplateResult | typeof nothing = nothing,
     missing: readonly string[] = [],
     missingNotice: TemplateResult | typeof nothing = nothing,
+    /** Counter for the servings (0.5.0): replaces the plain text; `busy` while the new amounts are on their way. */
+    portions?: { counter: TemplateResult; busy: boolean },
   ): TemplateResult {
     const missingSet = new Set(missing.map(lower));
     const facts: [string, string][] = [];
@@ -1873,7 +2445,7 @@ export class EatFreshPanel extends LitElement {
     if (prep) facts.push([this._t("prep_time"), prep]);
     if (cook) facts.push([this._t("cook_time"), cook]);
     const servings =
-      r.servings == null ? "" : r.servings === 1 ? this._t("servings_one") : this._t("servings", { n: r.servings });
+      portions || r.servings == null ? "" : this._servingsText(r.servings);
     return html`${this._backRow()}
       <div class="recipe-head">
         <div class="recipe-top">
@@ -1891,6 +2463,7 @@ export class EatFreshPanel extends LitElement {
                 ${servings ? html`<li>${icon(mdiSilverwareForkKnife)}${servings}</li>` : nothing}
               </ul>`
             : nothing}
+          ${portions?.counter ?? nothing}
         </div>
       </div>
       <div class="recipe-body">
@@ -1898,12 +2471,17 @@ export class EatFreshPanel extends LitElement {
           ? html`<section class="panel-box">
               <h2>${this._t("ingredients")}</h2>
               ${missingNotice}
-              <ul class="ingredients">
+              <ul class="ingredients ${portions?.busy ? "pending" : ""}" aria-busy=${portions?.busy ? "true" : "false"}>
                 ${r.ingredients.map((ing) => {
                   const qty = ingredientQty(this._lang, ing);
                   const gone = missingSet.size > 0 && missingSet.has(lower(ing.name || ing.raw));
+                  const from = ing.portion?.rounded_from;
                   return html`<li class=${gone ? "missing" : ""}>
-                    <span class="qty">${qty}</span>
+                    <span class="qty"
+                      >${qty}${from
+                        ? html`<span class="calc">${this._t("portions_calc", { n: localNumber(this._lang, from) })}</span>`
+                        : nothing}</span
+                    >
                     <span
                       >${ing.name || ing.raw}${ing.note ? html` <span class="note">(${ing.note})</span>` : nothing}${gone
                         ? html`<span class="miss-mark" title=${this._t("miss_item")}>${icon(mdiAlertCircleOutline)}</span
@@ -1989,11 +2567,13 @@ export class EatFreshPanel extends LitElement {
     const r = data.recipe;
     const id = data.kitchenowl_id;
     const busy = this._busy.has(id);
+    // The chosen servings go along (0.5.0); unknown base: nothing extra is sent.
+    const servings = data.portions?.scalable ? this._koServings : undefined;
     const actions = html`
-      <button class="btn primary" ?disabled=${this._shoppingBusy} @click=${() => this._addToShopping([id])}>
+      <button class="btn primary" ?disabled=${this._shoppingBusy} @click=${() => this._addToShopping([id], servings)}>
         ${icon(mdiCartPlus)}<span>${this._t("to_shopping_list")}</span>
       </button>
-      <button class="btn" @click=${() => this._openPlan(id, r.title, r.image)}>
+      <button class="btn" @click=${() => this._openPlan(id, r.title, r.image, servings)}>
         ${icon(mdiCalendarPlus)}<span>${this._t("plan")}</span>
       </button>
       <button class="btn" @click=${() => this._openCategories(id, r.title, data.tags)}>
@@ -2032,7 +2612,15 @@ export class EatFreshPanel extends LitElement {
           </div>
         </div>`
       : nothing;
-    return this._recipeLayout(r, isHttpUrl(r.url) ? hostOf(r.url) : "KitchenOwl", actions, extra, missing, notice);
+    return this._recipeLayout(
+      r,
+      isHttpUrl(r.url) ? hostOf(r.url) : "KitchenOwl",
+      actions,
+      extra,
+      missing,
+      notice,
+      this._koPortions(data),
+    );
   }
 
   // ---- collection view
@@ -2302,8 +2890,32 @@ export class EatFreshPanel extends LitElement {
   }
 
   private _renderEntry(e: PlannerEntry, date: string | null): TemplateResult {
-    const link = this._viewLink({ name: "korecipe", id: e.kitchenowl_id });
-    return html`<li class="entry">
+    // Entries without a day and without a number have no counter (0.5.0).
+    const servings = this._entryServings(e, date);
+    const link = this._viewLink(
+      servings != null ? { name: "korecipe", id: e.kitchenowl_id, servings } : { name: "korecipe", id: e.kitchenowl_id },
+    );
+    const counter =
+      servings != null && date
+        ? html`<div class="entry-servings">
+            ${this._counter(
+              servings,
+              SERVINGS_MIN,
+              SERVINGS_MAX,
+              {
+                group: this._t("plan_servings_label", { name: e.name }),
+                less: this._t("portions_less"),
+                more: this._t("portions_more"),
+                text: String(servings),
+                sr: this._t(servings === 1 ? "portions_word_one" : "portions_word"),
+              },
+              (delta) => this._stepPlanServings(e, date, delta),
+              true,
+            )}
+            <span class="entry-servings-label" aria-hidden="true">${this._t(servings === 1 ? "portions_word_one" : "portions_word")}</span>
+          </div>`
+        : nothing;
+    return html`<li class="entry ${counter === nothing ? "" : "has-servings"}">
       <a class="entry-link" href=${link.href} @click=${link.click}>
         ${this._photo(e.image, "thumb")}
         <span class="entry-name">${e.name}</span>
@@ -2316,6 +2928,7 @@ export class EatFreshPanel extends LitElement {
       >
         ${icon(mdiClose)}
       </button>
+      ${counter}
     </li>`;
   }
 
@@ -2352,7 +2965,9 @@ export class EatFreshPanel extends LitElement {
     if (!shop && this._shopState === "error")
       return this._note(`${this._t("shop_failed")} ${this._shopError}`, mdiAlertCircleOutline, () => this._loadShopping());
     if (!shop) return html`<p class="intro">${this._t("shop_intro")}</p>${this._shopSkeleton()}`;
-    if (!shop.picnic.available) {
+    const v5 = this._shopV5;
+    // An older core without Picnic: the explanation like before. With groups (0.5.0) a plain list to tick off.
+    if (!shop.picnic.available && !v5) {
       // Set up but not running is a different message than "not set up".
       const off = shop.picnic.reason_code === "not_loaded";
       return html`<div class="shop"><section class="explain" role="note">
@@ -2364,7 +2979,9 @@ export class EatFreshPanel extends LitElement {
           : nothing}
       </section></div>`;
     }
+    const picnic = shop.picnic.available;
     const items = shop.items;
+    const done = v5 ? this._doneEntries() : [];
     const reload = html`<button
       class="icon-btn"
       aria-label=${this._t("shop_refresh")}
@@ -2374,7 +2991,7 @@ export class EatFreshPanel extends LitElement {
     >
       ${icon(mdiRefresh)}
     </button>`;
-    if (!items.length)
+    if (!items.length && !done.length && !this._pendingBack.size)
       return html`<div class="shop">
         <div class="note">
           ${icon(mdiCartOutline)}
@@ -2384,38 +3001,57 @@ export class EatFreshPanel extends LitElement {
           </button>
         </div>
       </div>`;
-    const open = items.filter((i) => !i.sent_at && !i.skip);
+    const ticked = this._pendingDone;
+    // Without Picnic "never at Picnic" means nothing: every entry is on the list to tick off.
+    const open = items.filter((i) => !i.sent_at && (!i.skip || !picnic) && !ticked.has(i.item_id));
+    // Entries put back a moment ago, until the list is read again.
+    const placeholders = new Set<number>();
+    if (v5)
+      for (const { entry } of this._pendingBack.values())
+        if (!items.some((i) => i.item_id === entry.item_id)) {
+          placeholders.add(entry.item_id);
+          open.push({ item_id: entry.item_id, name: entry.name, description: entry.description, product: null, amount: 1, skip: false, sent_at: null, department: entry.department });
+        }
     const sent = items.filter((i) => !!i.sent_at);
-    const skipped = items.filter((i) => !i.sent_at && i.skip);
-    const missing = open.filter((i) => !i.product).length;
+    // 0.5.0: the cart goes under "Done"; "maybe in the cart" needs a look and stays in view.
+    const maybe = v5 ? sent.filter((i) => i.sent_uncertain) : [];
+    const cart = v5 ? sent.filter((i) => !i.sent_uncertain) : [];
+    const skipped = picnic ? items.filter((i) => !i.sent_at && i.skip && !ticked.has(i.item_id)) : [];
+    const missing = open.filter((i) => !i.product && !placeholders.has(i.item_id)).length;
     const n = this._pickedItems.length;
     const firstTime = open.length > 0 && missing === open.length && sent.length === 0;
     const notice = this._sendNotice;
-    return html`<div class="shop">
-      <div class="action-bar shop-bar">
-        <button
-          class="btn primary grow send"
-          ?disabled=${n === 0 || this._sending}
-          aria-label=${`${this._t("shop_send")} (${n})`}
-          @click=${() => this._askSend()}
-        >
-          ${icon(mdiCartPlus)}<span>${this._sending ? this._t("sending") : this._t("shop_send")}</span>
-          ${this._sending ? nothing : html`<span class="count-badge" aria-hidden="true">${n}</span>`}
-        </button>
-        ${reload}
-      </div>
-      <p class="shop-status" role="status">
-        ${open.length
-          ? missing
-            ? missing === 1
-              ? this._t("shop_open_one")
-              : this._t("shop_open", { n: missing })
-            : this._t("shop_all_mapped")
-          : nothing}
-        ${open.length && !n ? html`<span class="sub">${this._t("shop_none_picked")}</span>` : nothing}
-      </p>
-      ${firstTime ? html`<p class="intro">${this._t("shop_intro")}</p>` : nothing}
-      ${shop.picnic.search
+    const allDone = html`<div class="note">${icon(mdiCartCheck)}<div>${this._t(picnic ? "shop_all_done" : "shop_all_checked")}</div></div>`;
+    return html`<div class="shop ${v5 ? "v5" : ""}">
+      ${picnic
+        ? html`<div class="action-bar shop-bar">
+            <button
+              class="btn primary grow send"
+              ?disabled=${n === 0 || this._sending}
+              aria-label=${`${this._t("shop_send")} (${n})`}
+              @click=${() => this._askSend()}
+            >
+              ${icon(mdiCartPlus)}<span>${this._sending ? this._t("sending") : this._t("shop_send")}</span>
+              ${this._sending ? nothing : html`<span class="count-badge" aria-hidden="true">${n}</span>`}
+            </button>
+            ${reload}
+          </div>`
+        : html`<div class="action-bar shop-bar plain"><p class="plain-hint">${this._t("shop_plain_hint")}</p>${reload}</div>`}
+      ${picnic
+        ? html`<p class="shop-status" role="status">
+            ${open.length
+              ? missing
+                ? missing === 1
+                  ? this._t(v5 ? "shop_open_one_v5" : "shop_open_one")
+                  : this._t(v5 ? "shop_open_v5" : "shop_open", { n: missing })
+                : this._t("shop_all_mapped")
+              : nothing}
+            ${open.length && !n ? html`<span class="sub">${this._t("shop_none_picked")}</span>` : nothing}
+          </p>`
+        : nothing}
+      ${v5 ? html`<p class="sr" role="status">${this._shopAnnounce}</p>` : nothing}
+      ${picnic && firstTime ? html`<p class="intro">${this._t("shop_intro")}</p>` : nothing}
+      ${!picnic || shop.picnic.search
         ? nothing
         : html`<div class="banner info">
             ${icon(mdiInformationOutline)}<span
@@ -2432,10 +3068,15 @@ export class EatFreshPanel extends LitElement {
             </button>
           </div>`
         : nothing}
-      ${open.length
-        ? html`<ul class="shop-list">${open.map((i) => this._renderShopItem(i))}</ul>`
-        : html`<div class="note">${icon(mdiCartCheck)}<div>${this._t("shop_all_done")}</div></div>`}
-      ${sent.length
+      ${v5
+        ? open.length
+          ? this._renderGroups(open, placeholders)
+          : allDone
+        : open.length
+          ? html`<ul class="shop-list">${open.map((i) => this._renderShopItem(i))}</ul>`
+          : allDone}
+      ${maybe.length ? html`<ul class="shop-list maybe-list">${maybe.map((i) => this._renderShopItem(i))}</ul>` : nothing}
+      ${!v5 && sent.length
         ? html`<h2 class="shop-sub">${icon(mdiCartCheck)}${this._t("shop_in_cart_title")}</h2>
             <ul class="shop-list">${sent.map((i) => this._renderShopItem(i))}</ul>`
         : nothing}
@@ -2456,7 +3097,88 @@ export class EatFreshPanel extends LitElement {
             <p class="empty-day">${this._t("shop_skipped_hint")}</p>
             <ul class="shop-list">${skipped.map((i) => this._renderShopItem(i))}</ul>`
         : nothing}
+      ${v5 ? this._renderDone(done, cart) : nothing}
     </div>`;
+  }
+
+  /** Open entries in groups, in the order of `departments`; groups without entries are left out. */
+  private _renderGroups(open: ShoppingItem[], placeholders: Set<number>): TemplateResult {
+    const row = (i: ShoppingItem) => this._renderShopItem(i, placeholders.has(i.item_id));
+    const deps = this._shop?.departments ?? [];
+    if (!deps.length) return html`<ul class="shop-list">${repeat(open, (i) => i.item_id, row)}</ul>`;
+    const by = new Map<string, ShoppingItem[]>();
+    for (const i of open) {
+      const key = this._deptOf(i);
+      by.set(key, [...(by.get(key) ?? []), i]);
+    }
+    return html`${repeat(
+      deps.filter((d) => by.get(d.key)?.length),
+      (d) => d.key,
+      (d) => {
+        const list = by.get(d.key)!;
+        const count = list.length === 1 ? this._t("dept_count_one") : this._t("dept_count", { n: list.length });
+        return html`<section class="dept" data-dept=${d.key}>
+          <h2 class="dept-head">
+            <span class="dept-name">${d.name}</span><span class="dept-count" aria-hidden="true">${list.length}</span
+            ><span class="sr">, ${count}</span>
+          </h2>
+          <ul class="shop-list" aria-label=${d.name}>${repeat(list, (i) => i.item_id, row)}</ul>
+        </section>`;
+      },
+    )}`;
+  }
+
+  /** "Done": ticked-off entries and entries in the Picnic cart, closed until opened. */
+  private _renderDone(done: ShopDone[], cart: ShoppingItem[]): TemplateResult | typeof nothing {
+    const rows = [
+      ...done.map((e) => ({ key: `d${e.item_id}`, at: e.at, tpl: () => this._renderDoneRow(e) })),
+      ...cart.map((i) => ({ key: `c${i.item_id}`, at: i.sent_at ?? "", tpl: () => this._renderShopItem(i) })),
+    ].sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
+    if (!rows.length) return nothing;
+    const days = this._shop?.done_days ?? 3;
+    const open = this._doneOpen;
+    return html`<section class="done-sec">
+      <button class="done-toggle" aria-expanded=${open ? "true" : "false"} aria-controls="shop-done" @click=${() => (this._doneOpen = !open)}>
+        ${icon(mdiChevronDown, "i chev")}<span class="done-title">${this._t("shop_done_title", { n: rows.length })}</span>
+        <span class="done-hint">${days === 1 ? this._t("shop_done_hint_one") : this._t("shop_done_hint", { n: days })}</span>
+      </button>
+      <ul id="shop-done" class="shop-list done-list" ?hidden=${!open}>${repeat(rows, (r) => r.key, (r) => r.tpl())}</ul>
+    </section>`;
+  }
+
+  private _renderDoneRow(e: ShopDone): TemplateResult {
+    const id = e.item_id;
+    // Still on its way to the core: "back" waits for the answer.
+    const waiting = this._itemBusy.has(id) || (this._pendingDone.has(id) && this._pendingDone.get(id)!.seq == null);
+    const when = relativeDay(this._lang, e.at, this._hass?.config?.time_zone);
+    return html`<li class="shop-item done-item" data-done=${id}>
+      <span class="lead-ico">${icon(mdiCheck)}</span>
+      <div class="shop-body">
+        <div class="shop-name v5">
+          <span class="nm">${e.name}</span>${e.description
+            ? html`<span class="qty"><span class="desc">${localQty(this._lang, e.description)}</span></span>`
+            : nothing}
+        </div>
+        ${when ? html`<span class="when">${this._t("shop_done_when", { when })}</span>` : nothing}
+      </div>
+      <button class="btn small back" ?disabled=${waiting} aria-label=${this._t("shop_uncheck_label", { name: e.name })} @click=${() => void this._uncheck(e)}>
+        ${icon(mdiUndoVariant, "i s")}<span>${this._wide ? this._t("shop_uncheck") : this._t("shop_uncheck_short")}</span>
+      </button>
+    </li>`;
+  }
+
+  /** The round button that ticks an entry off (0.5.0); not the same as "take" for Picnic. */
+  private _doneBtn(item: ShoppingItem, locked = false): TemplateResult {
+    const label = this._t("shop_check", { name: item.name });
+    return html`<button
+      class="done-btn"
+      aria-label=${label}
+      title=${label}
+      ?disabled=${locked || this._itemBusy.has(item.item_id)}
+      @click=${() => void this._check(item)}
+    >
+      <span class="ring" aria-hidden="true">${icon(mdiCheck)}</span>
+    </button>`;
   }
 
   private async _toggleSkipped(): Promise<void> {
@@ -2467,13 +3189,39 @@ export class EatFreshPanel extends LitElement {
     this.renderRoot.querySelector(".skipped-head")?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
-  private _renderShopItem(item: ShoppingItem): TemplateResult {
+  private _renderShopItem(item: ShoppingItem, placeholder = false): TemplateResult {
     const id = item.item_id;
     const p = item.product;
     const busy = this._itemBusy.has(id);
-    const head = html`<div class="shop-name">
-      <span class="nm">${item.name}</span>${item.description ? html`<span class="desc">${item.description}</span>` : nothing}
+    const v5 = this._shopV5;
+    // 0.5.0: name left, quantity right in one line.
+    const head = v5
+      ? html`<div class="shop-name v5">
+          <span class="nm">${item.name}</span>${item.description || item.exact
+            ? html`<span class="qty">${item.description
+                ? html`<span class="desc">${localQty(this._lang, item.description)}</span>`
+                : nothing}${item.exact
+                ? html`<span class="calc">${this._t("portions_calc", { n: localNumber(this._lang, item.exact) })}</span>`
+                : nothing}</span>`
+            : nothing}
+        </div>`
+      : html`<div class="shop-name">
+      <span class="nm">${item.name}</span>${item.description
+        ? html`<span class="desc">${localQty(this._lang, item.description)}</span>`
+        : nothing}${item.exact
+        ? html`<span class="calc">${this._t("portions_calc", { n: localNumber(this._lang, item.exact) })}</span>`
+        : nothing}
     </div>`;
+    const small = item.small ?? null;
+    const smallN = this._smallCount(item);
+    // Sent: both products with the pieces that went into the cart (0.5.0).
+    const sentProducts = () => html`${p && (item.amount >= 1 || !small) ? product(false) : nothing}${small && smallN >= 1
+      ? html`<div class="product static small-product">
+          <span class="pname"><span class="small-tag">${this._t("shop_small_label")}:</span> ${small.name}</span
+          ><span class="pmeta">${this._productMeta(small)}</span>
+        </div>`
+      : nothing}`;
+    const sentCount = small && smallN >= 1 ? `${item.amount}× + ${smallN}×` : `${item.amount}×`;
     const product = (tappable: boolean) =>
       p
         ? tappable
@@ -2486,8 +3234,8 @@ export class EatFreshPanel extends LitElement {
       return html`<li class="shop-item sent maybe" data-item=${id}>
         <span class="lead-ico">${icon(mdiAlertCircleOutline)}</span>
         <div class="shop-body">
-          ${head}${product(false)}
-          <p class="maybe-text" role="note">${this._t("shop_maybe")} · ${item.amount}×</p>
+          ${head}${sentProducts()}
+          <p class="maybe-text" role="note">${this._t("shop_maybe")} · ${sentCount}</p>
           <div class="maybe-actions">
             <button class="btn small not-in-cart" ?disabled=${busy} @click=${() => this._undo(item, false, false)}>
               ${icon(mdiCartOutline, "i s")}<span>${this._t("shop_not_in_cart")}</span>
@@ -2499,10 +3247,18 @@ export class EatFreshPanel extends LitElement {
       return html`<li class="shop-item sent" data-item=${id}>
         <span class="lead-ico">${icon(mdiCartCheck)}</span>
         <div class="shop-body">
-          ${head}${product(false)}
+          ${head}${sentProducts()}
           <div class="sent-line">
-            <span>${this._t("shop_in_cart", { when: this._formatSent(item.sent_at) })} · ${item.amount}×</span>
+            <span
+              >${v5
+                ? this._t("shop_in_cart_when", { when: relativeDay(this._lang, item.sent_at, this._hass?.config?.time_zone) })
+                : this._t("shop_in_cart", { when: this._formatSent(item.sent_at) })}
+              · ${sentCount}</span
+            >
           </div>
+          ${this._itemErrors.get(id)
+            ? html`<p class="error-text item-error">${this._t("send_item_failed", { message: this._itemErrors.get(id)! })}</p>`
+            : nothing}
         </div>
         <button class="btn small undo" ?disabled=${busy} @click=${() => this._undo(item)}>
           ${icon(mdiUndoVariant, "i s")}<span>${this._t("undo")}</span>
@@ -2510,12 +3266,72 @@ export class EatFreshPanel extends LitElement {
       </li>`;
     if (item.skip)
       return html`<li class="shop-item skipped" data-item=${id}>
-        <span class="lead-ico">${icon(mdiCancel)}</span>
+        ${v5 ? this._doneBtn(item) : html`<span class="lead-ico">${icon(mdiCancel)}</span>`}
         <div class="shop-body">${head}</div>
         <button class="btn small take-back" @click=${() => this._setSkip(item, false)}>${this._t("shop_take_back")}</button>
       </li>`;
     const picked = this._isPicked(item);
     const error = this._itemErrors.get(id);
+    const mainStepper = html`<div class="stepper" role="group" aria-label=${`${this._t("shop_qty")}: ${item.name}`}>
+      <button class="icon-btn" aria-label=${this._t("shop_less")} ?disabled=${item.amount <= (smallN >= 1 ? 0 : 1)} @click=${() => this._setAmount(item, item.amount - 1)}>
+        ${icon(mdiMinus)}
+      </button>
+      <output aria-live="polite">${item.amount}</output>
+      <button class="icon-btn" aria-label=${this._t("shop_more")} ?disabled=${item.amount >= AMOUNT_MAX} @click=${() => this._setAmount(item, item.amount + 1)}>
+        ${icon(mdiPlus)}
+      </button>
+    </div>`;
+    const menu = html`<button
+      class="icon-btn item-menu"
+      aria-label=${this._t("shop_menu", { name: item.name })}
+      title=${this._t("shop_menu", { name: item.name })}
+      aria-haspopup="dialog"
+      @click=${() => (this._dialog = { kind: "item_menu", item_id: id })}
+    >
+      ${icon(mdiDotsVertical)}
+    </button>`;
+    if (v5) {
+      const picnic = !!this._shop?.picnic.available && !placeholder;
+      // "take" (for Picnic) sits with the product, apart from the round button that ticks off.
+      const take = html`<button
+        class="take-btn"
+        role="checkbox"
+        aria-checked=${picked ? "true" : "false"}
+        aria-label=${this._t("shop_take", { name: item.name })}
+        title=${this._t("shop_take", { name: item.name })}
+        @click=${() => this._setPicked(id, !picked)}
+      >
+        <span class="box" aria-hidden="true">${picked ? icon(mdiCheck) : nothing}</span><span class="take-text">${this._t("shop_take_short")}</span>
+      </button>`;
+      // Without a product only a quiet magnifier at the end of the row (0.5.0); the second row only with a product.
+      const pick =
+        picnic && !p
+          ? html`<button
+              class="icon-btn pick-product"
+              aria-label=${this._t("shop_pick_for", { name: item.name })}
+              title=${this._t("shop_pick_for", { name: item.name })}
+              aria-haspopup="dialog"
+              @click=${() => this._openProduct(item)}
+            >
+              ${icon(mdiMagnify)}<span class="pick-text" aria-hidden="true">${this._t("shop_pick_short")}</span>
+            </button>`
+          : nothing;
+      // Open again after a later transfer (0.5.0): what already went into the cart.
+      const hint = item.cart_hint
+        ? html`<p class="cart-hint">${icon(mdiCartOutline, "i s")}<span>${this._t("shop_cart_hint", { qty: localQty(this._lang, item.cart_hint) })}</span></p>`
+        : nothing;
+      return html`<li class="shop-item v5 ${picked ? "picked" : ""} ${error ? "failed" : ""} ${placeholder ? "pending" : ""}" data-item=${id}>
+        ${this._doneBtn(item, placeholder)}
+        <div class="shop-body">
+          ${head}${hint}
+          ${picnic && p
+            ? html`<div class="prod-row">${product(true)}<div class="take-row">${take}${mainStepper}</div></div>${this._smallLines(item)}`
+            : nothing}
+          ${error ? html`<p class="error-text item-error">${this._t("send_item_failed", { message: error })}</p>` : nothing}
+        </div>
+        <div class="row-end">${pick}${placeholder || (!picnic && !this._shop?.departments?.length) ? html`<span class="menu-gap"></span>` : menu}</div>
+      </li>`;
+    }
     return html`<li class="shop-item ${picked ? "picked" : ""} ${error ? "failed" : ""}" data-item=${id}>
       <button
         class="check-btn"
@@ -2531,30 +3347,49 @@ export class EatFreshPanel extends LitElement {
         ${head}
         ${p
           ? html`<div class="prod-row">${product(true)}
-              <div class="stepper" role="group" aria-label=${`${this._t("shop_qty")}: ${item.name}`}>
-                <button class="icon-btn" aria-label=${this._t("shop_less")} ?disabled=${item.amount <= 1} @click=${() => this._setAmount(item, item.amount - 1)}>
-                  ${icon(mdiMinus)}
-                </button>
-                <output aria-live="polite">${item.amount}</output>
-                <button class="icon-btn" aria-label=${this._t("shop_more")} ?disabled=${item.amount >= AMOUNT_MAX} @click=${() => this._setAmount(item, item.amount + 1)}>
-                  ${icon(mdiPlus)}
-                </button>
-              </div></div>`
+              ${mainStepper}</div>
+              ${this._smallLines(item)}`
           : html`<button class="btn pick-product" @click=${() => this._openProduct(item)}>
               ${icon(mdiMagnify)}<span>${this._t("shop_pick_product")}</span>
             </button>`}
         ${error ? html`<p class="error-text item-error">${this._t("send_item_failed", { message: error })}</p>` : nothing}
       </div>
-      <button
-        class="icon-btn item-menu"
-        aria-label=${this._t("shop_menu", { name: item.name })}
-        title=${this._t("shop_menu", { name: item.name })}
-        aria-haspopup="dialog"
-        @click=${() => (this._dialog = { kind: "item_menu", item_id: id })}
-      >
-        ${icon(mdiDotsVertical)}
-      </button>
+      ${menu}
     </li>`;
+  }
+
+  /** The smaller package of an entry (0.5.0): its own row with pieces, or the hint with a button to pick one. */
+  private _smallLines(item: ShoppingItem): TemplateResult | typeof nothing {
+    const small = item.small ?? null;
+    const smallN = this._smallCount(item);
+    return small
+                ? html`<div class="prod-row small-row">
+                    <button
+                      class="product small-product"
+                      aria-label=${`${this._t("shop_small_other")}: ${small.name}`}
+                      @click=${() => this._openProduct(item, true)}
+                    >
+                      <span class="pname"><span class="small-tag">${this._t("shop_small_label")}:</span> ${small.name}</span
+                      ><span class="pmeta">${this._productMeta(small)}</span>
+                    </button>
+                    <div class="stepper" role="group" aria-label=${`${this._t("shop_qty")}: ${small.name}`}>
+                      <button class="icon-btn" aria-label=${this._t("shop_small_less")} ?disabled=${smallN <= (item.amount >= 1 ? 0 : 1)} @click=${() => this._setSmallAmount(item, smallN - 1)}>
+                        ${icon(mdiMinus)}
+                      </button>
+                      <output aria-live="polite">${smallN}</output>
+                      <button class="icon-btn" aria-label=${this._t("shop_small_more")} ?disabled=${smallN >= AMOUNT_MAX} @click=${() => this._setSmallAmount(item, smallN + 1)}>
+                        ${icon(mdiPlus)}
+                      </button>
+                    </div>
+                  </div>`
+                : item.rest
+                  ? html`<div class="rest-line">
+                      <span>${this._t("shop_rest", { rest: localQty(this._lang, item.rest) })}</span>
+                      <button class="btn small pick-small" @click=${() => this._openProduct(item, true)}>
+                        ${icon(mdiMagnify, "i s")}<span>${this._t("shop_pick_small")}</span>
+                      </button>
+                    </div>`
+                  : nothing;
   }
 
   private _renderItemMenu(d: Dialog & { kind: "item_menu" }): TemplateResult {
@@ -2564,25 +3399,65 @@ export class EatFreshPanel extends LitElement {
       this._dialog = undefined;
       fn();
     };
+    const picnic = !!this._shop?.picnic.available;
     return this._dialogFrame(html`<div class="menu-list">
-      <button class="menu-item" @click=${() => this._openProduct(item)}>
-        ${icon(item.product ? mdiSwapHorizontal : mdiMagnify)}<span>${this._t(item.product ? "shop_other_product" : "shop_pick_product")}</span>
-      </button>
-      ${item.product
-        ? html`<button class="menu-item" @click=${run(() => void this._unmap(item))}>
-            ${icon(mdiLinkVariantOff)}<span>${this._t("shop_forget")}</span>
+      ${this._shopV5 && this._shop?.departments?.length
+        ? html`<button class="menu-item dept-change" @click=${() => (this._dialog = { kind: "department", item_id: item.item_id })}>
+            ${icon(mdiShapeOutline)}<span>${this._t("shop_dept_change")}</span>
           </button>`
         : nothing}
-      <button class="menu-item" @click=${run(() => void this._setSkip(item, true))}>
-        ${icon(mdiCancel)}<span>${this._t("shop_never")}</span>
-      </button>
+      ${picnic
+        ? html`<button class="menu-item" @click=${() => this._openProduct(item)}>
+              ${icon(item.product ? mdiSwapHorizontal : mdiMagnify)}<span>${this._t(item.product ? "shop_other_product" : "shop_pick_product")}</span>
+            </button>
+            ${item.product
+              ? html`<button class="menu-item" @click=${run(() => void this._unmap(item))}>
+                  ${icon(mdiLinkVariantOff)}<span>${this._t("shop_forget")}</span>
+                </button>`
+              : nothing}
+            ${item.small && !item.sent_at
+              ? html`<button class="menu-item" @click=${run(() => void this._mapSmall(item, null))}>
+                  ${icon(mdiClose)}<span>${this._t("shop_small_remove")}</span>
+                </button>`
+              : nothing}
+            <button class="menu-item" @click=${run(() => void this._setSkip(item, true))}>
+              ${icon(mdiCancel)}<span>${this._t("shop_never")}</span>
+            </button>`
+        : nothing}
     </div>`);
+  }
+
+  /** Groups to choose from (0.5.0); the current one is marked. */
+  private _renderDepartmentDialog(d: Dialog & { kind: "department" }): TemplateResult {
+    const item = this._item(d.item_id);
+    if (!item) return this._dialogFrame(html``);
+    const current = this._deptOf(item);
+    return this._dialogFrame(html`<ul class="pick-list depts">
+      ${(this._shop?.departments ?? []).map(
+        (dep: ShopDepartment) => html`<li>
+          <button
+            class="pick dept-pick"
+            aria-pressed=${dep.key === current ? "true" : "false"}
+            @click=${() => void this._setDepartment(item, dep.key)}
+          >
+            <span class="dept-name">${dep.name}</span>
+            ${dep.key === current ? html`<span class="chosen">${icon(mdiCheck, "i s")}${this._t("product_current")}</span>` : nothing}
+          </button>
+        </li>`,
+      )}
+    </ul>`);
   }
 
   private _renderProductDialog(d: Dialog & { kind: "product" }): TemplateResult {
     const item = this._item(d.item_id);
     const searchOk = !!this._shop?.picnic.search;
-    const current = item?.product?.id;
+    const forSmall = !!d.small;
+    const current = forSmall ? item?.small?.id : item?.product?.id;
+    const choose = (p: PicnicHit) => {
+      if (!item) return;
+      if (forSmall) void this._mapSmall(item, p);
+      else void this._mapProduct(item, p);
+    };
     let results: TemplateResult | typeof nothing = nothing;
     if (d.state === "loading")
       results = html`<div aria-busy="true" aria-label=${this._t("loading")}>
@@ -2594,8 +3469,12 @@ export class EatFreshPanel extends LitElement {
         ? html`<ul class="pick-list products">
             ${d.products.map(
               (p) => html`<li>
-                <button class="pick product-hit" aria-pressed=${p.id === current ? "true" : "false"} @click=${() => item && this._mapProduct(item, p)}>
-                  <span class="hit-text"><span class="pname">${p.name}</span><span class="pmeta">${this._productMeta(p)}</span></span>
+                <button class="pick product-hit" aria-pressed=${p.id === current ? "true" : "false"} @click=${() => choose(p)}>
+                  <span class="hit-text"
+                    ><span class="pname">${p.name}</span><span class="pmeta">${this._productMeta(p)}</span>${forSmall && p.fits_rest
+                      ? html`<span class="fits-mark">${icon(mdiCheck, "i s")}${this._t("shop_fits_rest")}</span>`
+                      : nothing}</span
+                  >
                   ${p.id === current ? html`<span class="chosen">${icon(mdiCheck, "i s")}${this._t("product_current")}</span>` : nothing}
                 </button>
               </li>`,
@@ -2604,7 +3483,11 @@ export class EatFreshPanel extends LitElement {
         : html`<p class="empty-day">${this._t("product_none")}</p>`;
     return this._dialogFrame(html`
       ${searchOk
-        ? html`<p class="dlg-hint">${this._t("product_hint")}</p>`
+        ? html`<p class="dlg-hint">
+            ${forSmall && d.small?.rest
+              ? this._t("small_hint", { rest: localQty(this._lang, d.small.rest) })
+              : this._t("product_hint")}
+          </p>`
         : html`<div class="banner info">${icon(mdiInformationOutline)}<span>${this._t("shop_no_search")}${this._shop?.picnic.reason_code
             ? html` ${this._t("shop_reason", { reason: picnicText(this._lang, this._shop.picnic.reason_code) })}`
             : nothing}</span></div>`}
@@ -2684,9 +3567,11 @@ export class EatFreshPanel extends LitElement {
       case "week_again":
         return this._t("week_again_title");
       case "product":
-        return this._t("product_title", { name: d.name });
+        return this._t(d.small ? "small_title" : "product_title", { name: d.name });
       case "item_menu":
         return this._item(d.item_id)?.name ?? "";
+      case "department":
+        return this._t("dept_title", { name: this._item(d.item_id)?.name ?? "" });
       case "send":
         return this._t("send_title");
       case "forget_missing":
@@ -2722,6 +3607,8 @@ export class EatFreshPanel extends LitElement {
         return this._renderProductDialog(d);
       case "item_menu":
         return this._renderItemMenu(d);
+      case "department":
+        return this._renderDepartmentDialog(d);
       case "send":
         return this._renderSendDialog(d);
       case "forget_missing":
@@ -2823,8 +3710,10 @@ export class EatFreshPanel extends LitElement {
       [this._t("planner_this"), days.filter((day) => day < nextMonday)],
       [this._t("planner_next"), days.filter((day) => day >= nextMonday)],
     ];
-    const entry: PlannerEntry = { kitchenowl_id: d.id, name: d.name, image: d.image };
-    return this._dialogFrame(html`${groups.map(
+    const entry: PlannerEntry = { kitchenowl_id: d.id, name: d.name, image: d.image, servings: d.servings ?? null };
+    return this._dialogFrame(html`${d.servings != null
+      ? html`<p class="dlg-hint plan-for">${this._t(d.servings === 1 ? "plan_for_one" : "plan_for", { n: d.servings })}</p>`
+      : nothing}${groups.map(
       ([label, list]) => html`<h3 class="dlg-sub">${label}</h3>
         <div class="day-picks">
           ${list.map(

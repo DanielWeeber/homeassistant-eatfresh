@@ -81,6 +81,11 @@ def send_items(*rows: tuple[int, str, int]) -> list[dict[str, Any]]:
     ]
 
 
+def sent_items(*rows: tuple[int, str, int]) -> list[dict[str, Any]]:
+    """The answer for sent entries: since 0.5.0 with ``small_amount``."""
+    return [{**row, "small_amount": 0} for row in send_items(*rows)]
+
+
 # ----- without Picnic -------------------------------------------------------
 
 
@@ -104,6 +109,15 @@ async def test_shopping_without_picnic(ws: WS, shopping_list: AsyncMock) -> None
         "skip": False,
         "sent_at": None,
         "sent_uncertain": False,
+        # 0.5.0: the amount text in the cart when the entry changed since.
+        "cart_hint": None,
+        # 0.5.0: smaller pack for the rest.
+        "rest": None,
+        "exact": None,
+        "small": None,
+        "small_amount": 0,
+        # 0.5.0: the group of the entry (no category in KitchenOwl: by name).
+        "department": "fruits_vegetables",
     }
     assert [item["item_id"] for item in result["items"]] == [101, 102, 103]
     shopping_list.assert_awaited_once_with(2)
@@ -174,6 +188,7 @@ async def test_search_both_forms(ws: WS, fake_picnic: FakePicnic) -> None:
         "name": "Kartoffeln festkochend",
         "unit_quantity": "2kg",
         "price": 249,
+        "fits_rest": False,  # 0.5.0
     }
     assert fake_picnic.client.searches == ["Kartoffeln"]
 
@@ -286,7 +301,7 @@ async def test_send(ws: WS, fake_picnic: FakePicnic) -> None:
         items=send_items((101, "s1000001", 2), (102, "s1000002", 2)),
     )
     assert msg["result"] == {
-        "sent": send_items((101, "s1000001", 2), (102, "s1000002", 2)),
+        "sent": sent_items((101, "s1000001", 2), (102, "s1000002", 2)),
         "failed": [],
     }
     assert fake_picnic.added == [("s1000001", 2), ("s1000002", 2)]
@@ -320,7 +335,7 @@ async def test_send_checks_the_list(ws: WS, fake_picnic: FakePicnic) -> None:
         items=send_items((999, "s1", 1), (101, "s1", 1), (101, "s1", 1)),
     )
     result = msg["result"]
-    assert result["sent"] == send_items((101, "s1", 1))
+    assert result["sent"] == sent_items((101, "s1", 1))
     assert result["failed"] == [
         {
             "item_id": 999,
@@ -352,7 +367,7 @@ async def test_send_stops_at_an_unknown_product(
         items=send_items((101, "s1", 1), (102, "s2", 1), (103, "s3", 1)),
     )
     result = msg["result"]
-    assert result["sent"] == send_items((101, "s1", 1))
+    assert result["sent"] == sent_items((101, "s1", 1))
     assert [(f["item_id"], f["code"]) for f in result["failed"]] == [
         (102, "not_added"),
         (103, "not_tried"),
@@ -375,7 +390,7 @@ async def test_send_stops_on_auth_error(ws: WS, fake_picnic: FakePicnic) -> None
         items=send_items((101, "s1", 1), (102, "s2", 1), (103, "s3", 1)),
     )
     result = msg["result"]
-    assert result["sent"] == send_items((101, "s1", 1))
+    assert result["sent"] == sent_items((101, "s1", 1))
     assert [(f["item_id"], f["code"]) for f in result["failed"]] == [
         (102, "auth"),
         (103, "not_tried"),
@@ -407,7 +422,7 @@ async def test_send_stops_at_any_error(
         items=send_items((101, "s1", 1), (102, "s2", 1), (103, "s3", 1)),
     )
     result = msg["result"]
-    assert result["sent"] == send_items((101, "s1", 1))
+    assert result["sent"] == sent_items((101, "s1", 1))
     assert [(f["item_id"], f["code"]) for f in result["failed"]] == [
         (102, "maybe_sent"),
         (103, "not_tried"),
@@ -461,7 +476,7 @@ async def test_send_twice_at_the_same_time(
     assert msg["error"]["code"] == "picnic_error"
     hold.set()
     result = await first
-    assert result["sent"] == send_items((101, "s1", 1))
+    assert result["sent"] == sent_items((101, "s1", 1))
     assert len(fake_picnic.added) == 1
 
 
@@ -667,7 +682,7 @@ async def test_undo_takes_out_only_what_was_put_in(
     msg = await ws.call(
         "eatfresh/picnic/send", items=send_items((102, "s2", 1), (101, "s1", 2))
     )
-    assert msg["result"]["sent"] == send_items((102, "s2", 1), (101, "s1", 2))
+    assert msg["result"]["sent"] == sent_items((102, "s2", 1), (101, "s1", 2))
     assert fake_picnic.client.cart == {"s1": 3, "s2": 1}
     await ws.call("eatfresh/picnic/undo", item_id=101)
     assert fake_picnic.client.cart == {"s1": 1, "s2": 1}

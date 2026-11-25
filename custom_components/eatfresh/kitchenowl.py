@@ -1,7 +1,12 @@
 """Client for the KitchenOwl REST API (tested against KitchenOwl 0.8.1).
 
 Pure Python: no Home Assistant imports. The client never deletes recipes,
-items or lists; the only DELETE it sends removes a meal plan entry.
+items, categories or lists. It sends exactly two kinds of DELETE: one removes
+a meal plan entry, the other takes an entry off the shopping list
+(``DELETE /api/shoppinglist/<id>/item``). Taking an entry off the list keeps
+the item and every recipe that uses it (measured on the test KitchenOwl,
+0.5.0). Deleting an item itself would take it out of all recipes, so the
+client has no call for it.
 
 Facts taken from the KitchenOwl 0.8.1 backend source:
 
@@ -22,15 +27,25 @@ Facts taken from the KitchenOwl 0.8.1 backend source:
   for a new link. The answer is the full recipe with the item ids.
 * The meal plan (``/api/household/<id>/planner``) stores a real date per
   entry. See :meth:`KitchenOwlClient.list_planner`.
+* Categories (measured on the test KitchenOwl, 0.5.0): a new household has
+  ten of its own with a ``default_key`` (``bread``, ``canned``, ``dairy``,
+  ``drinks``, ``freezer``, ``fruits_vegetables``, ``grain``, ``hygiene``,
+  ``refrigerated``, ``snacks``); their names depend on the language of the
+  server. ``POST /api/household/<id>/category`` creates one more even when
+  the name exists already. ``POST /api/item/<id>`` with ``category: {id}``
+  sets the category of an item (``category_id`` alone is ignored).
+* ``DELETE /api/shoppinglist/<id>/item`` answers 200 also for an entry not on
+  the list, and ``recipeitems`` answers 200 also for an item that no longer
+  exists (nothing is added then).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
 import logging
 import math
 import re
 import time
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
@@ -39,6 +54,7 @@ import aiohttp
 
 from .errors import EatFreshError, KitchenOwlAuthError, KitchenOwlError, RecipeNotFound
 from .models import Ingredient, Recipe
+from .portions import MAX_SERVINGS, MIN_SERVINGS, Scaled, scale_description
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,7 +99,9 @@ _COUNT_UNITS = frozenset(
     {"x", "stk", "stk.", "stück", "stueck", "st", "st.", "piece", "pieces", "pc", "pcs"}
 )
 _STEP_NUMBER = re.compile(r"^\s*(?:schritt|step)?\s*\d+\s*[.):]\s*", re.IGNORECASE)
-_NUMBERED_LINE = re.compile(r"^\s*(?:schritt|step)?\s*\d+\s*[.):]\s+(.*)$", re.IGNORECASE)
+_NUMBERED_LINE = re.compile(
+    r"^\s*(?:schritt|step)?\s*\d+\s*[.):]\s+(.*)$", re.IGNORECASE
+)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _AUTH_HINT = re.compile(r"token|segments|authorization|signature|jwt|subject", re.I)
 
@@ -488,8 +506,13 @@ def _split_description(text: str) -> tuple[str | None, list[str]]:
     (a recipe written in the KitchenOwl app) every paragraph is one step.
     Nothing is dropped: only the numbers are removed.
     """
-    lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-    first = next((i for i, line in enumerate(lines) if _NUMBERED_LINE.match(line)), None)
+    lines = [
+        line.rstrip()
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    first = next(
+        (i for i, line in enumerate(lines) if _NUMBERED_LINE.match(line)), None
+    )
     if first is None:
         paragraphs = [
             "\n".join(part.strip() for part in block.split("\n") if part.strip())
@@ -518,6 +541,83 @@ def _positive_minutes(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return int(value) if value > 0 else None
+
+
+def yields_of(value: Any) -> int | None:
+    """Return a ``yields`` of KitchenOwl as a whole number from 1, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
+        return None
+    return int(value) if value >= 1 else None
+
+
+def shopping_items(
+    recipe: Mapping[str, Any], servings: int | None
+) -> list[tuple[dict[str, Any], Scaled]]:
+    """Return the items of a recipe for the shopping list, scaled to ``servings``.
+
+    This is the one place where the amount texts for the list are scaled.
+    Each entry is the item as ``recipeitems`` takes it (``id``, ``name``,
+    ``description``, ``optional``) and the result of
+    :func:`~.portions.scale_description` for its amount text. The base is
+    the ``yields`` of the recipe. With unknown base, no ``servings`` or the
+    same number, every amount text stays character for character.
+
+    A recipe that is not scalable (base above 99, so no counter) is never
+    scaled: ``servings`` is dropped here, for every way to the list (the
+    panel, the week, the actions).
+    """
+    base = yields_of(recipe.get("yields"))
+    if base is None or not MIN_SERVINGS <= base <= MAX_SERVINGS:
+        servings = None
+    result: list[tuple[dict[str, Any], Scaled]] = []
+    for item in recipe.get("items") or []:
+        if not isinstance(item, dict) or "id" not in item or not item.get("name"):
+            continue
+        scaled = scale_description(item.get("description") or "", base, servings)
+        result.append(
+            (
+                {
+                    "id": int(item["id"]),
+                    "name": item["name"],
+                    "description": scaled.description,
+                    "optional": bool(item.get("optional", False)),
+                },
+                scaled,
+            )
+        )
+    return result
+
+
+class ItemNotFound(KitchenOwlError):
+    """KitchenOwl has no item with this id (any more)."""
+
+
+def category_of(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the category of a list row or item as ``{id, name, default_key}``.
+
+    KitchenOwl sends ``category`` (the whole category) when there is one and
+    ``category_id: null`` otherwise. A row with only ``category_id`` gets an
+    empty name. None without a category.
+    """
+    raw = row.get("category")
+    if isinstance(raw, Mapping):
+        cat_id = _item_id(raw.get("id"))
+        if cat_id is not None:
+            name = raw.get("name")
+            key = raw.get("default_key")
+            return {
+                "id": cat_id,
+                "name": " ".join(name.split()) if isinstance(name, str) else "",
+                "default_key": key if isinstance(key, str) and key else None,
+            }
+    cat_id = _item_id(row.get("category_id"))
+    if cat_id is not None:
+        return {"id": cat_id, "name": "", "default_key": None}
+    return None
 
 
 def recipe_to_model(data: dict) -> Recipe:
@@ -567,7 +667,9 @@ def recipe_to_model(data: dict) -> Recipe:
 class KitchenOwlClient:
     """Small async client for the parts of the KitchenOwl API EatFresh uses."""
 
-    def __init__(self, session: aiohttp.ClientSession, base_url: str, token: str) -> None:
+    def __init__(
+        self, session: aiohttp.ClientSession, base_url: str, token: str
+    ) -> None:
         base = base_url.strip().rstrip("/")
         if base.lower().endswith("/api"):
             base = base[:-4].rstrip("/")
@@ -633,7 +735,9 @@ class KitchenOwlClient:
                 try:
                     return await response.json(content_type=None)
                 except (ValueError, aiohttp.ContentTypeError) as err:
-                    raise KitchenOwlError(f"Invalid JSON from KitchenOwl ({path})") from err
+                    raise KitchenOwlError(
+                        f"Invalid JSON from KitchenOwl ({path})"
+                    ) from err
         except KitchenOwlError:
             raise
         except TimeoutError as err:
@@ -643,6 +747,8 @@ class KitchenOwlClient:
 
     @staticmethod
     def _error_for(status: int, path: str, body: str) -> EatFreshError:
+        if status == 404 and path.startswith("/api/item/"):
+            return ItemNotFound(f"The item is gone from KitchenOwl ({path})")
         # KitchenOwl answers 403 for a recipe of a household the user of the
         # token is not in. The token is fine, so this is no reason to log in
         # again.
@@ -679,15 +785,16 @@ class KitchenOwlClient:
         return [{"id": item["id"], "name": item.get("name", "")} for item in data]
 
     async def list_shoppinglist_items(self, shoppinglist_id: int) -> list[dict]:
-        """Return the open entries of a list as ``[{id, name, description}]``.
+        """Return the open entries of a list as ``[{id, name, description, category}]``.
 
         Read only: nothing on the list is changed or removed. Uses
         ``GET /api/shoppinglist/<id>/items`` (KitchenOwl 0.8.1). KitchenOwl
         keeps no "checked" state on the server: an entry that is bought is
         taken off the list, so every row it returns is open. The order is the
         one of the server (by name). ``description`` is the amount text and
-        is ``""`` when there is none. Rows without an id or a name are
-        skipped.
+        is ``""`` when there is none. ``category`` is the category of the
+        item (``{id, name, default_key}``, see :func:`category_of`) or None.
+        Rows without an id or a name are skipped.
         """
         path = f"/api/shoppinglist/{int(shoppinglist_id)}/items"
         data = self._expect(await self._request("GET", path), list, path)
@@ -700,7 +807,7 @@ class KitchenOwlClient:
                 continue
             try:
                 item_id = int(row["id"])
-            except (KeyError, TypeError, ValueError):
+            except KeyError, TypeError, ValueError:
                 continue
             description = row.get("description")
             items.append(
@@ -708,9 +815,102 @@ class KitchenOwlClient:
                     "id": item_id,
                     "name": name,
                     "description": description if isinstance(description, str) else "",
+                    "category": category_of(row),
                 }
             )
         return items
+
+    async def remove_from_shoppinglist(
+        self, shoppinglist_id: int, item_id: int
+    ) -> None:
+        """Take one entry off a shopping list (``DELETE …/<id>/item``).
+
+        The item itself stays, and so does every recipe that uses it: this
+        is what KitchenOwl does when an entry is ticked off. The caller reads
+        the list first, because KitchenOwl also answers 200 for an entry
+        that is not on the list.
+        """
+        path = f"/api/shoppinglist/{int(shoppinglist_id)}/item"
+        await self._request("DELETE", path, json={"item_id": int(item_id)})
+
+    async def add_item_to_shoppinglist(
+        self, shoppinglist_id: int, item_id: int, name: str, description: str
+    ) -> None:
+        """Put one item with an amount text on a list, summing like recipes do.
+
+        Uses ``recipeitems``: an entry already on the list gets the amount
+        added (``200g`` and ``100g`` make ``300g``), a new one gets the text.
+        KitchenOwl answers 200 for an item that no longer exists as well, so
+        the caller checks the list afterwards.
+        """
+        path = f"/api/shoppinglist/{int(shoppinglist_id)}/recipeitems"
+        item = {
+            "id": int(item_id),
+            "name": name,
+            "description": description or "",
+            "optional": False,
+        }
+        await self._request("POST", path, json={"items": [item]})
+
+    async def get_item(self, item_id: int) -> dict | None:
+        """Return an item as ``{id, name, category}``, or None if it is gone."""
+        path = f"/api/item/{int(item_id)}"
+        try:
+            data = self._expect(await self._request("GET", path), dict, path)
+        except ItemNotFound:
+            return None
+        name = data.get("name")
+        return {
+            "id": int(item_id),
+            "name": name if isinstance(name, str) else "",
+            "category": category_of(data),
+        }
+
+    async def list_categories(self, household_id: int) -> list[dict]:
+        """Return the categories of a household as ``[{id, name, default_key}]``.
+
+        In the order of KitchenOwl (``ordering``, then id). Rows without a
+        whole id are skipped.
+        """
+        path = f"/api/household/{int(household_id)}/category"
+        data = self._expect(await self._request("GET", path), list, path)
+        rows: list[tuple[int, int, dict]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            category = category_of({"category": row})
+            if category is None:
+                continue
+            ordering = row.get("ordering")
+            if isinstance(ordering, bool) or not isinstance(ordering, int):
+                ordering = 0
+            rows.append((ordering, category["id"], category))
+        return [category for _order, _id, category in sorted(rows, key=lambda r: r[:2])]
+
+    async def create_category(self, household_id: int, name: str) -> dict:
+        """Create a category and return it as ``{id, name, default_key}``.
+
+        KitchenOwl creates a second one with the same name as well, so the
+        caller looks for an existing one first.
+        """
+        path = f"/api/household/{int(household_id)}/category"
+        data = self._expect(
+            await self._request("POST", path, json={"name": name}), dict, path
+        )
+        category = category_of({"category": data})
+        if category is None:
+            raise KitchenOwlError(f"Unexpected answer from KitchenOwl ({path})")
+        return category
+
+    async def set_item_category(self, item_id: int, category_id: int | None) -> None:
+        """Set the category of an item (None: no category).
+
+        Only the category is sent; the item keeps its name, and no recipe
+        or list entry changes.
+        """
+        path = f"/api/item/{int(item_id)}"
+        body = {"category": None if category_id is None else {"id": int(category_id)}}
+        await self._request("POST", path, json=body)
 
     async def list_recipes(self, household_id: int) -> list[dict]:
         """Return all recipes of a household, reduced to the fields we use.
@@ -751,6 +951,20 @@ class KitchenOwlClient:
             return cached[1]
         return await self.list_recipes(household_id)
 
+    async def recipe_summary(self, household_id: int, recipe_id: int) -> dict | None:
+        """Return one recipe of the (cached) recipe list, or None.
+
+        Reuses the list for a short time (see ``RECIPE_LIST_TTL``), so it
+        normally sends no request; ``yields`` of the recipe is in it.
+        """
+        for recipe in await self._cached_recipes(household_id):
+            try:
+                if int(recipe["id"]) == int(recipe_id):
+                    return dict(recipe)
+            except KeyError, TypeError, ValueError:
+                continue
+        return None
+
     async def recipe_ids(self, household_id: int, *, fresh: bool = False) -> set[int]:
         """Return the ids of all recipes of a household.
 
@@ -765,7 +979,7 @@ class KitchenOwlClient:
         for recipe in recipes:
             try:
                 ids.add(int(recipe["id"]))
-            except (KeyError, TypeError, ValueError):
+            except KeyError, TypeError, ValueError:
                 continue
         return ids
 
@@ -811,7 +1025,10 @@ class KitchenOwlClient:
         return _tag_names(data.get("tags"))
 
     async def list_planner(self, household_id: int) -> list[dict]:
-        """Return the meal plan as ``[{recipe_id, name, photo, date}]``.
+        """Return the meal plan as ``[{recipe_id, name, photo, date, yields, base}]``.
+
+        ``yields`` is the number of servings of the entry and ``base`` the
+        ``yields`` of the recipe (whole numbers from 1, else None).
 
         KitchenOwl 0.8.1 stores one row per recipe and day: ``cooking_date``
         is a timestamp (ms) of midnight UTC of a real date, so the date is
@@ -829,7 +1046,7 @@ class KitchenOwlClient:
             recipe = item.get("recipe") if isinstance(item.get("recipe"), dict) else {}
             try:
                 recipe_id = int(item.get("recipe_id", recipe.get("id")))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             entries.append(
                 {
@@ -837,24 +1054,36 @@ class KitchenOwlClient:
                     "name": recipe.get("name") or "",
                     "photo": recipe.get("photo") or None,
                     "date": _ms_to_day(item.get("cooking_date")),
+                    "yields": yields_of(item.get("yields")),
+                    "base": yields_of(recipe.get("yields")),
                 }
             )
         return entries
 
     async def add_planner_entry(
-        self, household_id: int, recipe_id: int, day: date
+        self,
+        household_id: int,
+        recipe_id: int,
+        day: date,
+        yields: int | None = None,
     ) -> None:
         """Plan a recipe on a day (``POST .../planner/recipe``).
 
         ``day`` is sent as midnight UTC, the way KitchenOwl stores it.
-        Planning the same recipe on the same day again changes nothing; a
-        recipe that was planned without a day loses that entry (the server
-        replaces it).
+        ``yields`` (servings of the entry) is sent when given; KitchenOwl
+        refuses null. Planning the same recipe on the same day again changes
+        nothing, not even ``yields`` (measured 25.11.2026); a recipe that was
+        planned without a day loses that entry (the server replaces it).
         """
         if not isinstance(day, date) or isinstance(day, datetime):
             raise KitchenOwlError("The planner needs a date")
         path = f"/api/household/{int(household_id)}/planner/recipe"
-        body = {"recipe_id": int(recipe_id), "cooking_date": _day_to_ms(day)}
+        body: dict[str, Any] = {
+            "recipe_id": int(recipe_id),
+            "cooking_date": _day_to_ms(day),
+        }
+        if yields is not None:
+            body["yields"] = int(yields)
         await self._request("POST", path, json=body)
 
     async def remove_planner_entry(
@@ -1037,26 +1266,23 @@ class KitchenOwlClient:
         }
 
     async def add_recipe_to_shoppinglist(
-        self, shoppinglist_id: int, recipe_id: int, recipe: dict | None = None
+        self,
+        shoppinglist_id: int,
+        recipe_id: int,
+        recipe: dict | None = None,
+        servings: int | None = None,
     ) -> int:
         """Put all ingredients of a recipe on a list; return how many.
 
         Uses ``POST /api/shoppinglist/<id>/recipeitems``, the only call that
         merges amounts with entries already on the list. ``recipe`` is the
-        recipe as KitchenOwl just returned it; without it, it is read.
+        recipe as KitchenOwl just returned it; without it, it is read. Each
+        amount text is scaled to ``servings`` (see :func:`shopping_items`);
+        the recipe itself is not changed.
         """
         if recipe is None:
             recipe = await self.get_recipe(recipe_id)
-        items = [
-            {
-                "id": int(item["id"]),
-                "name": item["name"],
-                "description": item.get("description") or "",
-                "optional": bool(item.get("optional", False)),
-            }
-            for item in recipe.get("items") or []
-            if isinstance(item, dict) and "id" in item and item.get("name")
-        ]
+        items = [item for item, _scaled in shopping_items(recipe, servings)]
         if not items:
             return 0
         path = f"/api/shoppinglist/{int(shoppinglist_id)}/recipeitems"

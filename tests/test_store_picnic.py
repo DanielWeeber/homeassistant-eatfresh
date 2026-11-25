@@ -66,7 +66,7 @@ async def test_upgrade_from_0_3_0_keeps_everything(
     _product(store, "Milch", "s1")
     await _save(hass)
     saved = hass_storage[STORAGE_KEY]
-    assert saved["minor_version"] == 4
+    assert saved["minor_version"] == 5  # 0.5.0
     for key, value in old.items():
         assert saved["data"][key] == value
     assert saved["data"]["picnic_map"]["milch"]["product_id"] == "s1"
@@ -143,9 +143,21 @@ async def test_broken_picnic_parts_are_ignored(
             },
             "picnic_skip": ["Salz", 5, "salz", ""],
             "picnic_sent": {
-                "101": {"product_id": "s1", "amount": 2, "at": "2026-11-15T10:00:00+00:00"},
-                "abc": {"product_id": "s1", "amount": 2, "at": "2026-11-15T10:00:00+00:00"},
-                "102": {"product_id": "s1", "amount": 0, "at": "2026-11-15T10:00:00+00:00"},
+                "101": {
+                    "product_id": "s1",
+                    "amount": 2,
+                    "at": "2026-11-15T10:00:00+00:00",
+                },
+                "abc": {
+                    "product_id": "s1",
+                    "amount": 2,
+                    "at": "2026-11-15T10:00:00+00:00",
+                },
+                "102": {
+                    "product_id": "s1",
+                    "amount": 0,
+                    "at": "2026-11-15T10:00:00+00:00",
+                },
                 "103": {"product_id": "s1", "amount": 1, "at": "yesterday"},
             },
         },
@@ -218,19 +230,46 @@ async def test_sizes_are_limited(hass: HomeAssistant) -> None:
 
 
 async def test_prune_sent(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
+    """0.5.0: marks live 3 days (was 14).
+
+    An unclear mark goes after 3 days. A mark surely in the cart stays while
+    its entry is on the list: the entry is taken off the list first (it is
+    then due), and the mark goes with it. Due is only a mark whose amount
+    text is still the one on the list; a mark without one (0.4.x) is never
+    due and goes after 3 days (changed after the review: marks carry the
+    amount text now).
+    """
     store = FavoritesStore(hass)
     await store.async_load()
-    store.async_set_picnic_sent(1, "s1", 1)
-    freezer.tick(timedelta(days=10))
-    store.async_set_picnic_sent(2, "s2", 1)
-    store.async_set_picnic_sent(3, "s3", 1)
-    store.async_prune_picnic_sent([1, 2])
+    texts = {1: "1", 2: "2", 4: "4", 5: "5 Dose"}
+    store.async_set_picnic_sent(1, "s1", 1, description="1")
+    store.async_set_picnic_sent(4, "s4", 1, uncertain=True, description="4")
+    store.async_set_picnic_sent(5, "s5", 1, description=" 3 Dose ")
+    store.async_set_picnic_sent(6, "s6", 1)  # 0.4.x: no amount text
+    freezer.tick(timedelta(days=2))
+    store.async_set_picnic_sent(2, "s2", 1, description="2")
+    store.async_set_picnic_sent(3, "s3", 1, description="3")
+    store.async_prune_picnic_sent([1, 2, 4, 5, 6], {**texts, 6: "6"})
     assert store.picnic_sent(3) is None  # off the list
     assert store.picnic_sent(1) is not None
-    freezer.tick(timedelta(days=5))
-    store.async_prune_picnic_sent([1, 2])
-    assert store.picnic_sent(1) is None  # older than 14 days
+    assert store.picnic_sent(5) is not None  # changed, but young
+    assert store.picnic_sent(6) is not None
+    assert store.due_cart_marks({**texts, 6: "6"}) == []
+    freezer.tick(timedelta(days=1, minutes=1))
+    assert store.due_cart_marks({**texts, 6: "6"}) == [1]
+    store.async_prune_picnic_sent([1, 2, 4, 5, 6], {**texts, 6: "6"})
+    assert store.picnic_sent(4) is None  # unclear and older than 3 days
+    assert store.picnic_sent(5) is None  # changed and older: mark goes
+    assert store.picnic_sent(6) is None  # no amount text and older
+    assert store.picnic_sent(1) is not None  # sure: due, not dropped
+    assert store.due_cart_marks(texts) == [1]
+    # Blanks at the ends do not count, any other change does.
+    assert store.due_cart_marks({1: " 1 "}) == [1]
+    assert store.due_cart_marks({1: "1 "}) == [1]
+    assert store.due_cart_marks({1: "2"}) == []
     assert store.picnic_sent(2) is not None
+    store.async_prune_picnic_sent([2])
+    assert store.picnic_sent(1) is None
 
 
 def test_picnic_key() -> None:

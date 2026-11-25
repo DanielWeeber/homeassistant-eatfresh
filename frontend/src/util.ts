@@ -30,8 +30,36 @@ export function ingredientQty(lang: Lang, ing: Ingredient): string {
   const raw = (ing.raw ?? "").trim();
   const name = (ing.name ?? "").trim();
   if (name && raw.length > name.length && raw.toLowerCase().endsWith(name.toLowerCase()))
-    return raw.slice(0, raw.length - name.length).trim();
+    return localQty(lang, raw.slice(0, raw.length - name.length).trim());
   return "";
+}
+
+/**
+ * A quantity text of the core ("0.75 EL", "1.5 Dose, (400 g)", dot as the
+ * decimal mark) in the language of the panel: in German the dot between two
+ * digits becomes a comma. Nothing else changes, and notes in brackets stay
+ * exactly as they are.
+ */
+export function localQty(lang: Lang, text: string): string {
+  if (lang !== "de" || !text || !text.includes(".")) return text;
+  let depth = 0;
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "(") depth++;
+    else if (c === ")" && depth > 0) depth--;
+    const digits = /\d/.test(text[i - 1] ?? "") && /\d/.test(text[i + 1] ?? "");
+    out += c === "." && depth === 0 && digits ? "," : c;
+  }
+  return out;
+}
+
+/** A plain number of the core ("1.5") in the language of the panel ("1,5"); unreadable text stays as it is. */
+export function localNumber(lang: Lang, text: string | number | null | undefined): string {
+  if (text == null || text === "") return "";
+  const n = typeof text === "number" ? text : Number(String(text).trim());
+  if (!Number.isFinite(n)) return String(text);
+  return n.toLocaleString(lang === "de" ? "de-DE" : "en-US", { maximumFractionDigits: 2, useGrouping: false });
 }
 
 /** Return a short host name for a URL, or the input itself. */
@@ -64,8 +92,19 @@ export function picnicText(lang: Lang, code: string | null | undefined): string 
 }
 
 /** Map a WebSocket error to a translated, user friendly message. */
+/** `unscheduled_entry` or `plan_entry_lost` from `planner/set_servings` (as code or translation key), else null. */
+export function planErrorCode(err: unknown): "unscheduled_entry" | "plan_entry_lost" | null {
+  const e = (err ?? {}) as WsError;
+  for (const c of [e.code, e.translation_key])
+    if (c === "unscheduled_entry" || c === "plan_entry_lost") return c;
+  return null;
+}
+
 export function errorText(lang: Lang, err: unknown): string {
   const e = (err ?? {}) as WsError;
+  // set_servings (0.5.0): the panel has its own words for these two codes.
+  const plan = planErrorCode(err);
+  if (plan) return translate(lang, plan === "unscheduled_entry" ? "err_unscheduled_entry" : "err_plan_entry_lost");
   switch (e.code) {
     case "source_error":
       return translate(lang, "err_source_error");
@@ -187,4 +226,40 @@ export function formatWeek(lang: Lang, monday: string): string {
 export function formatPrice(lang: Lang, cents: number | null | undefined): string {
   if (cents == null || !Number.isFinite(cents)) return "";
   return new Intl.NumberFormat(locale(lang), { style: "currency", currency: "EUR" }).format(cents / 100);
+}
+
+/** Calendar day ("YYYY-MM-DD") of a moment in the time zone of Home Assistant (browser zone as fallback). */
+export function dayIn(when: Date, zone?: string): string {
+  if (zone) {
+    try {
+      // en-CA formats as YYYY-MM-DD.
+      return new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }).format(when);
+    } catch {
+      /* unknown zone: browser zone */
+    }
+  }
+  return isoDate(when);
+}
+
+/**
+ * Whole days between an ISO time (UTC) and now, counted in calendar days of
+ * Home Assistant: 0 today, 1 yesterday. Null for an unreadable time; never below 0.
+ */
+export function daysAgo(iso: string | null | undefined, zone?: string, now: Date = new Date()): number | null {
+  if (!iso) return null;
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return null;
+  const a = dayIn(when, zone).split("-").map(Number);
+  const b = dayIn(now, zone).split("-").map(Number);
+  const diff = Math.round((Date.UTC(b[0], b[1] - 1, b[2]) - Date.UTC(a[0], a[1] - 1, a[2])) / 86400000);
+  return Math.max(0, diff);
+}
+
+/** "heute", "gestern", "vor 3 Tagen" (or English) for an ISO time; "" if unreadable. */
+export function relativeDay(lang: Lang, iso: string | null | undefined, zone?: string, now?: Date): string {
+  const n = daysAgo(iso, zone, now);
+  if (n == null) return "";
+  if (n === 0) return translate(lang, "day_today");
+  if (n === 1) return translate(lang, "day_yesterday");
+  return translate(lang, "day_ago", { n });
 }

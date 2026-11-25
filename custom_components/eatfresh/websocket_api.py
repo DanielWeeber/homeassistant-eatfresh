@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import date
 from functools import wraps
-import logging
-import re
 from typing import Any
 
+import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
-import voluptuous as vol
 
+from . import picnic
 from .const import (
     DEFAULT_SEARCH_LIMIT,
     DOMAIN,
@@ -27,7 +28,9 @@ from .const import (
     MAX_PICNIC_AMOUNT,
     MAX_PICNIC_NAME_LENGTH,
     MAX_PICNIC_QUERY_LENGTH,
+    MAX_PICNIC_REST_LENGTH,
     MAX_PICNIC_SEND_ITEMS,
+    MAX_PICNIC_SMALL_AMOUNT,
     MAX_PLANNER_YEAR,
     MAX_SEARCH_LIMIT,
     MAX_TAG_LENGTH,
@@ -35,6 +38,7 @@ from .const import (
     MIN_PLANNER_YEAR,
     PICNIC_SEARCH_LIMIT,
 )
+from .departments import DEPARTMENTS
 from .errors import (
     EatFreshError,
     KitchenOwlAuthError,
@@ -45,12 +49,16 @@ from .errors import (
 )
 from .image_proxy import sign_image_url, sign_photo
 from .kitchenowl import MAX_ITEM_NAME
-from . import picnic
+from .picnic_amount import fits_rest
+from .portions import MAX_SERVINGS, MIN_SERVINGS
 from .runtime import (
+    FOREIGN_PREFIX,
     EatFreshData,
     PlannerWeek,
+    ShoppingEntryError,
     ShoppingListPartial,
     async_reauth_on_auth_error,
+    entry_servings,
     error_message,
     get_runtime_data,
     today,
@@ -59,6 +67,16 @@ from .runtime import (
 _LOGGER = logging.getLogger(__name__)
 
 KITCHENOWL_ID = vol.All(vol.Coerce(int), vol.Range(min=1))
+
+
+def whole_number(value: Any) -> int:
+    """Accept only a whole number: no bool, no text, no float (not 3.0)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise vol.Invalid("Expected a whole number")
+    return value
+
+
+SERVINGS = vol.All(whole_number, vol.Range(min=MIN_SERVINGS, max=MAX_SERVINGS))
 # Names of remembered ingredients (KitchenOwl allows 128 characters).
 INGREDIENT_NAMES = vol.All(
     [vol.All(str, vol.Length(min=1, max=MAX_ITEM_NAME))], vol.Length(max=200)
@@ -97,6 +115,8 @@ type Handler = Callable[
 def error_code(err: EatFreshError) -> str:
     """Map an EatFresh error to a WebSocket error code."""
     # Order matters: subclasses first.
+    if isinstance(err, ShoppingEntryError):
+        return err.code
     if isinstance(err, SourceBlocked):
         return ERR_SOURCE_BLOCKED
     if isinstance(err, RecipeNotFound):
@@ -152,6 +172,15 @@ def _with_data(
                     "message": error_message(err.cause),
                 },
             )
+        except ShoppingEntryError as err:
+            # The message is in the language of Home Assistant already.
+            connection.send_error(
+                msg["id"],
+                err.code,
+                error_message(err),
+                translation_key=err.code,
+                translation_domain=DOMAIN,
+            )
         except picnic.PicnicError as err:
             # The panel translates the code of a Picnic error (translation_key).
             connection.send_error(
@@ -190,14 +219,19 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
         ws_planner,
         ws_planner_add,
         ws_planner_remove,
+        ws_planner_set_servings,
         ws_planner_shopping_list,
         ws_shopping,
         ws_picnic_search,
         ws_picnic_map,
+        ws_picnic_map_small,
         ws_picnic_unmap,
         ws_picnic_skip,
         ws_picnic_send,
         ws_picnic_undo,
+        ws_shopping_check,
+        ws_shopping_uncheck,
+        ws_shopping_set_department,
     ):
         websocket_api.async_register_command(hass, command)
 
@@ -403,6 +437,7 @@ async def ws_collection(
     {
         vol.Required("type"): "eatfresh/collection/recipe",
         vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Optional("servings"): SERVINGS,
     }
 )
 @websocket_api.async_response
@@ -416,12 +451,18 @@ async def ws_collection_recipe(
     """Return a recipe as stored in KitchenOwl, without loading its web page.
 
     The ingredients include the remembered ones missing in KitchenOwl;
-    ``missing`` lists their names.
+    ``missing`` lists their names. The amounts are scaled to ``servings``
+    (default: the start value of the recipe); ``portions`` says how, and
+    each ingredient carries ``portion: {scaled, rounded_from}``.
     """
     kitchenowl_id = msg["kitchenowl_id"]
-    recipe, missing = await data.async_collection_recipe_missing(kitchenowl_id)
+    recipe, missing, portions, marks = await data.async_collection_recipe_portions(
+        kitchenowl_id, msg.get("servings")
+    )
     item = recipe.as_dict()
     item["image"] = sign_photo(hass, recipe.image)
+    for ingredient, mark in zip(item["ingredients"], marks, strict=False):
+        ingredient["portion"] = mark
     connection.send_result(
         msg["id"],
         {
@@ -430,6 +471,7 @@ async def ws_collection_recipe(
             "tags": data.localize_tags(recipe.tags),
             "hidden": data.store.is_hidden(kitchenowl_id),
             "missing": missing,
+            "portions": portions,
         },
     )
 
@@ -540,9 +582,7 @@ async def ws_collection_forget(
     Without ``names`` all missing ones are forgotten. KitchenOwl stays
     unchanged.
     """
-    result = await data.async_forget_ingredients(
-        msg["kitchenowl_id"], msg.get("names")
-    )
+    result = await data.async_forget_ingredients(msg["kitchenowl_id"], msg.get("names"))
     connection.send_result(
         msg["id"], {"removed": result["removed"], "missing": result["missing"]}
     )
@@ -568,6 +608,7 @@ async def ws_tags(
         vol.Required("kitchenowl_ids"): vol.All(
             [vol.Coerce(int)], vol.Length(min=1, max=50)
         ),
+        vol.Optional("servings"): SERVINGS,
     }
 )
 @websocket_api.async_response
@@ -578,17 +619,32 @@ async def ws_shopping_list_add(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Put the ingredients of KitchenOwl recipes on the shopping list."""
-    added = await data.async_add_to_shopping_list(msg["kitchenowl_ids"])
+    """Put the ingredients of KitchenOwl recipes on the shopping list.
+
+    The amounts are scaled to ``servings`` (default: the start value of
+    each recipe).
+    """
+    added = await data.async_add_to_shopping_list(
+        msg["kitchenowl_ids"], msg.get("servings")
+    )
     connection.send_result(msg["id"], {"added": added})
 
 
-def _planner_item(hass: HomeAssistant, entry: dict[str, Any]) -> dict[str, Any]:
-    """Return one meal plan entry as the panel and the cards read it."""
+def _planner_item(
+    hass: HomeAssistant, entry: dict[str, Any], default: int
+) -> dict[str, Any]:
+    """Return one meal plan entry as the panel and the cards read it.
+
+    ``servings`` is the number of the entry, else the start value of the
+    recipe, else None; ``base`` the ``yields`` of the recipe or None.
+    """
+    base = entry.get("base")
     return {
         "kitchenowl_id": entry["recipe_id"],
         "name": entry.get("name"),
         "image": sign_photo(hass, entry.get("photo")),
+        "servings": entry_servings(entry, default),
+        "base": base if isinstance(base, int) else None,
     }
 
 
@@ -598,20 +654,24 @@ def _week_result(
     """Return a week; ``today`` lets the panel and the cards use HA's day.
 
     ``shopping_list_at`` is when the week went to the shopping list (ISO
-    time, UTC) or None.
+    time, UTC) or None. ``default_servings`` is the option of the entry.
     """
+    default = data.default_servings
     return {
         "week_start": week.week_start.isoformat(),
         "today": today().isoformat(),
         "shopping_list_at": data.week_list_time(week.week_start),
+        "default_servings": default,
         "days": [
             {
                 "date": day.isoformat(),
-                "entries": [_planner_item(hass, entry) for entry in entries],
+                "entries": [_planner_item(hass, entry, default) for entry in entries],
             }
             for day, entries in week.days
         ],
-        "unscheduled": [_planner_item(hass, entry) for entry in week.unscheduled],
+        "unscheduled": [
+            _planner_item(hass, entry, default) for entry in week.unscheduled
+        ],
     }
 
 
@@ -645,6 +705,7 @@ async def ws_planner(
         vol.Required("type"): "eatfresh/planner/add",
         vol.Required("kitchenowl_id"): KITCHENOWL_ID,
         vol.Required("date"): _iso_date,
+        vol.Optional("servings"): SERVINGS,
     }
 )
 @websocket_api.async_response
@@ -655,8 +716,34 @@ async def ws_planner_add(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Plan a KitchenOwl recipe on a day."""
-    await data.async_planner_add(msg["kitchenowl_id"], msg["date"])
+    """Plan a KitchenOwl recipe on a day (default: its start servings)."""
+    await data.async_planner_add(msg["kitchenowl_id"], msg["date"], msg.get("servings"))
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/planner/set_servings",
+        vol.Required("kitchenowl_id"): KITCHENOWL_ID,
+        vol.Required("date"): _iso_date,
+        vol.Required("servings"): SERVINGS,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_planner_set_servings(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Change the servings of a recipe planned on a day.
+
+    The shopping list stays as it is, even if the week went to it.
+    """
+    await data.async_planner_set_servings(
+        msg["kitchenowl_id"], msg["date"], msg["servings"]
+    )
     connection.send_result(msg["id"], {})
 
 
@@ -732,6 +819,22 @@ def _price_cents(value: Any) -> int:
 
 PICNIC_PRODUCT_ID = _picnic_product_id
 PICNIC_AMOUNT = vol.All(vol.Coerce(int), vol.Range(min=1, max=MAX_PICNIC_AMOUNT))
+# 0.5.0: in a transfer the main product may have 0 pieces (only the smaller
+# product goes in), and the smaller product 0 to 20.
+PICNIC_SEND_AMOUNT = vol.All(vol.Coerce(int), vol.Range(min=0, max=MAX_PICNIC_AMOUNT))
+PICNIC_SMALL_AMOUNT = vol.All(
+    vol.Coerce(int), vol.Range(min=0, max=MAX_PICNIC_SMALL_AMOUNT)
+)
+PICNIC_REST_TEXT = vol.All(str, vol.Strip, vol.Length(max=MAX_PICNIC_REST_LENGTH))
+
+
+def _something_to_send(item: dict[str, Any]) -> dict[str, Any]:
+    """Require at least one piece of the main or the smaller product."""
+    if item["amount"] < 1 and item["small_amount"] < 1:
+        raise vol.Invalid("amount or small_amount must be at least 1")
+    return item
+
+
 PICNIC_PRODUCT = vol.Schema(
     {
         vol.Required("id"): PICNIC_PRODUCT_ID,
@@ -766,6 +869,9 @@ async def ws_shopping(
         vol.Required("query"): vol.All(
             str, vol.Strip, vol.Length(min=1, max=MAX_PICNIC_QUERY_LENGTH)
         ),
+        # 0.5.0: the rest a smaller pack has to cover and the main pack.
+        vol.Optional("rest"): vol.Any(None, PICNIC_REST_TEXT),
+        vol.Optional("main_unit_quantity"): vol.Any(None, PICNIC_REST_TEXT),
     }
 )
 @websocket_api.async_response
@@ -776,8 +882,16 @@ async def ws_picnic_search(
     msg: dict[str, Any],
     data: EatFreshData,
 ) -> None:
-    """Search Picnic products (only when the user asks)."""
+    """Search Picnic products (only when the user asks).
+
+    Each hit says whether it is a smaller pack that covers ``rest``
+    (``fits_rest``); without ``rest`` it is always False.
+    """
     products = await picnic.async_search(hass, msg["query"], PICNIC_SEARCH_LIMIT)
+    rest = msg.get("rest") or None
+    main = msg.get("main_unit_quantity") or None
+    for product in products:
+        product["fits_rest"] = fits_rest(rest, product.get("unit_quantity"), main)
     connection.send_result(msg["id"], {"products": products})
 
 
@@ -807,6 +921,46 @@ async def ws_picnic_map(
         price=product["price"],
         amount=msg.get("amount"),
     )
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/picnic/map_small",
+        vol.Required("name"): PICNIC_NAME,
+        vol.Required("product"): vol.Any(None, PICNIC_PRODUCT),
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_picnic_map_small(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Remember (or with ``product: null`` forget) the smaller product.
+
+    Only for an ingredient with a remembered main product (else not found).
+    """
+    product = msg["product"]
+    small = (
+        None
+        if product is None
+        else {
+            "product_id": product["id"],
+            "name": product["name"],
+            "unit_quantity": product["unit_quantity"] or None,
+            "price": product["price"],
+        }
+    )
+    if not data.store.async_set_picnic_small(msg["name"], small):
+        connection.send_error(
+            msg["id"],
+            ERR_NOT_FOUND,
+            "No Picnic product is remembered for this ingredient",
+        )
+        return
     connection.send_result(msg["id"], {})
 
 
@@ -851,12 +1005,18 @@ async def ws_picnic_skip(
         vol.Required("type"): "eatfresh/picnic/send",
         vol.Required("items"): vol.All(
             [
-                vol.Schema(
-                    {
-                        vol.Required("item_id"): KITCHENOWL_ID,
-                        vol.Required("product_id"): PICNIC_PRODUCT_ID,
-                        vol.Required("amount"): PICNIC_AMOUNT,
-                    }
+                vol.All(
+                    vol.Schema(
+                        {
+                            vol.Required("item_id"): KITCHENOWL_ID,
+                            vol.Required("product_id"): PICNIC_PRODUCT_ID,
+                            vol.Required("amount"): PICNIC_SEND_AMOUNT,
+                            vol.Optional(
+                                "small_amount", default=0
+                            ): PICNIC_SMALL_AMOUNT,
+                        }
+                    ),
+                    _something_to_send,
                 )
             ],
             vol.Length(min=1, max=MAX_PICNIC_SEND_ITEMS),
@@ -872,9 +1032,7 @@ async def ws_picnic_send(
     data: EatFreshData,
 ) -> None:
     """Put products into the Picnic cart. Nothing is ever ordered."""
-    connection.send_result(
-        msg["id"], await data.async_picnic_send(hass, msg["items"])
-    )
+    connection.send_result(msg["id"], await data.async_picnic_send(hass, msg["items"]))
 
 
 @websocket_api.websocket_command(
@@ -895,4 +1053,81 @@ async def ws_picnic_undo(
 ) -> None:
     """Take what EatFresh put into the cart for an entry out again."""
     await data.async_picnic_undo(hass, msg["item_id"], msg["remove"])
+    connection.send_result(msg["id"], {})
+
+
+# ----- ticking off and groups (0.5.0) ---------------------------------------
+
+_FOREIGN_KEY = re.compile(rf"{re.escape(FOREIGN_PREFIX)}[1-9][0-9]{{0,9}}")
+
+
+def _department(value: Any) -> str:
+    """Validate the key of a group: one of ``DEPARTMENTS`` or ``ko:<id>``."""
+    if isinstance(value, str) and (
+        value in DEPARTMENTS or _FOREIGN_KEY.fullmatch(value)
+    ):
+        return value
+    raise vol.Invalid("Expected the key of a group of the shopping list")
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/shopping/check",
+        vol.Required("item_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_shopping_check(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Tick an entry off: it leaves the KitchenOwl list (the item stays)."""
+    await data.async_shopping_check(msg["item_id"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/shopping/uncheck",
+        vol.Required("item_id"): KITCHENOWL_ID,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_shopping_uncheck(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Put an entry ticked off back on the list with its remembered amount."""
+    await data.async_shopping_uncheck(msg["item_id"])
+    connection.send_result(msg["id"], {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "eatfresh/shopping/set_department",
+        vol.Required("item_id"): KITCHENOWL_ID,
+        vol.Required("name"): vol.All(
+            str, vol.Strip, vol.Length(min=1, max=MAX_ITEM_NAME)
+        ),
+        vol.Required("department"): _department,
+    }
+)
+@websocket_api.async_response
+@_with_data
+async def ws_shopping_set_department(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    data: EatFreshData,
+) -> None:
+    """Put an ingredient into another group (and its item in KitchenOwl)."""
+    await data.async_shopping_set_department(
+        msg["item_id"], msg["name"], msg["department"]
+    )
     connection.send_result(msg["id"], {})

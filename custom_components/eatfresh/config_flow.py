@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
+from collections.abc import Mapping
 from typing import Any
 
+import voluptuous as vol
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -27,18 +28,20 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
     TextSelectorType,
 )
-import voluptuous as vol
 from yarl import URL
 
 from .const import (
     CHEFKOCH,
     CONF_ACCEPT_CHEFKOCH,
+    CONF_DEFAULT_SERVINGS,
     CONF_HOUSEHOLD_ID,
     CONF_PLANNER_INTERVAL,
     CONF_SHOPPINGLIST_ID,
     CONF_SOURCES,
     CONF_TOKEN,
     CONF_URL,
+    CONF_WRITE_CATEGORIES,
+    DEFAULT_WRITE_CATEGORIES,
     DOMAIN,
     MAX_PLANNER_INTERVAL,
     MIN_PLANNER_INTERVAL,
@@ -46,7 +49,8 @@ from .const import (
 )
 from .errors import KitchenOwlAuthError, KitchenOwlError
 from .kitchenowl import KitchenOwlClient
-from .runtime import enabled_source_ids, planner_interval
+from .portions import MAX_DEFAULT_SERVINGS, MIN_SERVINGS
+from .runtime import default_servings, enabled_source_ids, planner_interval
 from .sources import SOURCE_CLASSES
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +65,14 @@ INTERVAL_SELECTOR = NumberSelector(
         step=1,
         mode=NumberSelectorMode.BOX,
         unit_of_measurement="min",
+    )
+)
+SERVINGS_SELECTOR = NumberSelector(
+    NumberSelectorConfig(
+        min=MIN_SERVINGS,
+        max=MAX_DEFAULT_SERVINGS,
+        step=1,
+        mode=NumberSelectorMode.BOX,
     )
 )
 
@@ -82,7 +94,9 @@ def _minutes(options: Mapping[str, Any]) -> int:
 def _options(items: list[dict[str, Any]]) -> list[SelectOptionDict]:
     """Turn KitchenOwl objects with id and name into select options."""
     return [
-        SelectOptionDict(value=str(item["id"]), label=str(item.get("name") or item["id"]))
+        SelectOptionDict(
+            value=str(item["id"]), label=str(item.get("name") or item["id"])
+        )
         for item in items
     ]
 
@@ -259,7 +273,7 @@ class EatFreshConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class EatFreshOptionsFlow(OptionsFlowWithReload):
-    """Choose the active recipe sources and the meal plan interval."""
+    """Choose the sources, the meal plan interval, the servings and categories."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -276,6 +290,17 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
             interval = _minutes(
                 user_input if CONF_PLANNER_INTERVAL in user_input else options
             )
+            # Entries of 0.4.1 have no default servings: the form shows 3.
+            servings = default_servings(
+                user_input if CONF_DEFAULT_SERVINGS in user_input else options
+            )
+            # Entries before 0.5.0 have no such option: it is on.
+            write = bool(
+                user_input.get(
+                    CONF_WRITE_CATEGORIES,
+                    options.get(CONF_WRITE_CATEGORIES, DEFAULT_WRITE_CATEGORIES),
+                )
+            )
             if CHEFKOCH in selected and not accepted:
                 errors[CONF_ACCEPT_CHEFKOCH] = "chefkoch_terms"
             else:
@@ -284,6 +309,8 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
                         CONF_SOURCES: selected,
                         CONF_ACCEPT_CHEFKOCH: accepted,
                         CONF_PLANNER_INTERVAL: interval,
+                        CONF_DEFAULT_SERVINGS: servings,
+                        CONF_WRITE_CATEGORIES: write,
                     }
                 )
             current = selected
@@ -292,6 +319,8 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
             current = enabled_source_ids(options, SOURCE_CLASSES)
             current_accepted = bool(options.get(CONF_ACCEPT_CHEFKOCH, False))
             interval = _minutes(options)
+            servings = default_servings(options)
+            write = bool(options.get(CONF_WRITE_CATEGORIES, DEFAULT_WRITE_CATEGORIES))
 
         schema = vol.Schema(
             {
@@ -311,6 +340,10 @@ class EatFreshOptionsFlow(OptionsFlowWithReload):
                 vol.Optional(
                     CONF_PLANNER_INTERVAL, default=interval
                 ): INTERVAL_SELECTOR,
+                vol.Optional(
+                    CONF_DEFAULT_SERVINGS, default=servings
+                ): SERVINGS_SELECTOR,
+                vol.Optional(CONF_WRITE_CATEGORIES, default=write): BooleanSelector(),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

@@ -31,6 +31,7 @@ from .test_websocket_picnic import (  # noqa: F401  (fixtures)
     fake_picnic,
     no_pause,
     send_items,
+    sent_items,
     shopping_list,
     ws,
 )
@@ -80,7 +81,7 @@ async def test_product_already_in_the_cart_is_sent(
     msg = await ws.call(
         "eatfresh/picnic/send", items=send_items((101, "s1", 2), (102, "s2", 1))
     )
-    assert msg["result"]["sent"] == send_items((101, "s1", 2), (102, "s2", 1))
+    assert msg["result"]["sent"] == sent_items((101, "s1", 2), (102, "s2", 1))
     assert msg["result"]["failed"] == []
     assert fake_picnic.client.cart == {"s1": 3, "s2": 1}
     # Undo takes out only the pieces EatFresh put in.

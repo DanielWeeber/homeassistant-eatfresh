@@ -43,6 +43,23 @@ export interface Ingredient {
   unit: string | null;
   note: string | null;
   raw: string;
+  /** How the core scaled this ingredient to the chosen servings (0.5.0). Absent on older integrations. */
+  portion?: IngredientPortion;
+}
+
+export interface IngredientPortion {
+  scaled: boolean;
+  /** Exact number before rounding up to whole pieces, with a dot ("1.5"), or null. */
+  rounded_from: string | null;
+}
+
+/** Servings of a recipe of the collection (0.5.0). Absent on older integrations. */
+export interface Portions {
+  servings: number | null;
+  base: number | null;
+  default: number;
+  start: number | null;
+  scalable: boolean;
 }
 
 export interface Recipe {
@@ -89,6 +106,8 @@ export interface CollectionRecipeResponse {
   hidden: boolean;
   /** Names of ingredients that are gone from KitchenOwl; `recipe.ingredients` still has them. Absent on older integrations. */
   missing?: string[];
+  /** Servings shown and the recipe's own number (0.5.0). Absent on older integrations. */
+  portions?: Portions;
 }
 
 /** Answer of `eatfresh/collection/restore`: names written back, and names still missing afterwards. */
@@ -112,6 +131,10 @@ export interface PlannerEntry {
   kitchenowl_id: number;
   name: string;
   image: string | null;
+  /** Servings of this entry (0.5.0): its own number, else the start value of the recipe, else null. */
+  servings?: number | null;
+  /** `yields` of the recipe in KitchenOwl (0.5.0), or null. */
+  base?: number | null;
 }
 
 export interface PlannerDay {
@@ -127,6 +150,8 @@ export interface PlannerResponse {
   unscheduled: PlannerEntry[];
   /** When the week went to the shopping list (ISO time), on any device. */
   shopping_list_at?: string | null;
+  /** Option of the integration (0.5.0). */
+  default_servings?: number;
 }
 
 export interface WeekShoppingResponse {
@@ -153,6 +178,11 @@ export interface PicnicProduct {
   price: number | null;
 }
 
+/** A hit of `eatfresh/picnic/search`; `fits_rest` only when asked with a rest (0.5.0). */
+export interface PicnicHit extends PicnicProduct {
+  fits_rest?: boolean;
+}
+
 export interface PicnicStatus {
   available: boolean;
   search: boolean;
@@ -174,16 +204,49 @@ export interface ShoppingItem {
   sent_at: string | null;
   /** Picnic did not answer in time: it may or may not be in the cart. */
   sent_uncertain?: boolean;
+  /** What the last package only has to cover, for example "200 ml" (0.5.0), or null. */
+  rest?: string | null;
+  /** Exact number of packages from the scaled recipes, with a dot ("1.5") (0.5.0), or null. */
+  exact?: string | null;
+  /** A smaller package for the rest (0.5.0), or null. */
+  small?: PicnicProduct | null;
+  /** Pieces of the smaller package (0.5.0). */
+  small_amount?: number;
+  /** Open again after a later transfer added to it: the quantity text that went to the cart, dot as decimal mark (0.5.0), or null. */
+  cart_hint?: string | null;
+  /** Key of the group (department) the entry belongs to (0.5.0, shopping); missing on an older core. */
+  department?: string;
+}
+
+/** A group of the shopping list in shop order, `name` with emoji (0.5.0). */
+export interface ShopDepartment {
+  key: string;
+  name: string;
+}
+
+/** An entry ticked off the list; EatFresh still shows it for `done_days` days (0.5.0). */
+export interface ShopDone {
+  item_id: number;
+  name: string;
+  description: string;
+  department: string;
+  /** When it was ticked off (ISO, UTC). */
+  at: string;
 }
 
 /** Answer of `eatfresh/shopping` (reads KitchenOwl and the store, never Picnic). */
 export interface ShoppingResponse {
   picnic: PicnicStatus;
   items: ShoppingItem[];
+  /** All groups in order (0.5.0). Missing on an older core: the list shows without groups and without ticking. */
+  departments?: ShopDepartment[];
+  /** Ticked-off entries, newest first (0.5.0). */
+  done?: ShopDone[];
+  done_days?: number;
 }
 
 export interface PicnicSendResponse {
-  sent: { item_id: number; product_id: string; amount: number }[];
+  sent: { item_id: number; product_id: string; amount: number; small_amount?: number }[];
   /** `code` is translated by the panel; `message` is English, only a fallback. */
   failed: { item_id: number; code?: string; message: string }[];
 }
@@ -196,4 +259,5 @@ export type View =
   | { name: "planner" }
   | { name: "shopping" }
   | { name: "recipe"; key?: string; url?: string }
-  | { name: "korecipe"; id: number };
+  /** `servings`: open with this number (from the week plan); not part of the URL. */
+  | { name: "korecipe"; id: number; servings?: number };

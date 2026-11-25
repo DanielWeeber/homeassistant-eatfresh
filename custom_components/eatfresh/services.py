@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Awaitable, Callable
 from datetime import date
-import functools
 from typing import Any
 
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -15,8 +17,6 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
 
 from .const import (
     ATTR_DATE,
@@ -25,15 +25,16 @@ from .const import (
     ATTR_NAME_ONLY,
     ATTR_QUERY,
     ATTR_RECIPE_ID,
+    ATTR_SERVINGS,
     ATTR_START_DATE,
     ATTR_URL,
-    DEFAULT_PLANNER_DAYS,
     DEFAULT_COLLECTION_LIMIT,
+    DEFAULT_PLANNER_DAYS,
     DOMAIN,
+    MAX_COLLECTION_LIMIT,
     MAX_PLANNER_DAYS,
     MAX_PLANNER_YEAR,
     MAX_QUERY_LENGTH,
-    MAX_COLLECTION_LIMIT,
     MIN_PLANNER_YEAR,
     SERVICE_ADD_TO_SHOPPING_LIST,
     SERVICE_GET_PLANNER,
@@ -49,17 +50,20 @@ from .errors import (
     RecipeNotFound,
     SourceBlocked,
 )
+from .portions import MAX_SERVINGS, MIN_SERVINGS
 from .runtime import (
     NOT_IN_COLLECTION,
     EatFreshData,
     async_reauth_on_auth_error,
     dated_entries,
+    entry_servings,
     error_message,
     get_runtime_data,
     plan_item,
     today,
     unscheduled_entries,
 )
+from .websocket_api import whole_number
 
 
 def _planner_day(value: Any) -> date:
@@ -77,8 +81,24 @@ def _planner_day(value: Any) -> date:
 
 RECIPE_ID = vol.All(vol.Coerce(int), vol.Range(min=1))
 
+
+def whole_servings(value: Any) -> int:
+    """Accept a whole number, also as a float with a whole value (3.0 is 3).
+
+    Templates of scripts often give 3.0 (an ``input_number``). Refused: a
+    float with a fraction (2.5 is never cut to 2), bool, text ("3"), None.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return whole_number(value)
+
+
+SERVINGS = vol.All(whole_servings, vol.Range(min=MIN_SERVINGS, max=MAX_SERVINGS))
+
 IMPORT_RECIPE_SCHEMA = vol.Schema({vol.Required(ATTR_URL): cv.url})
-ADD_TO_SHOPPING_LIST_SCHEMA = vol.Schema({vol.Required(ATTR_RECIPE_ID): RECIPE_ID})
+ADD_TO_SHOPPING_LIST_SCHEMA = vol.Schema(
+    {vol.Required(ATTR_RECIPE_ID): RECIPE_ID, vol.Optional(ATTR_SERVINGS): SERVINGS}
+)
 SEARCH_COLLECTION_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_QUERY): vol.All(cv.string, vol.Length(max=MAX_QUERY_LENGTH)),
@@ -97,7 +117,11 @@ GET_PLANNER_SCHEMA = vol.Schema(
     }
 )
 PLAN_RECIPE_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_RECIPE_ID): RECIPE_ID, vol.Required(ATTR_DATE): _planner_day}
+    {
+        vol.Required(ATTR_RECIPE_ID): RECIPE_ID,
+        vol.Required(ATTR_DATE): _planner_day,
+        vol.Optional(ATTR_SERVINGS): SERVINGS,
+    }
 )
 UNPLAN_RECIPE_SCHEMA = vol.Schema(
     {vol.Required(ATTR_RECIPE_ID): RECIPE_ID, vol.Optional(ATTR_DATE): _planner_day}
@@ -169,8 +193,13 @@ async def _async_import_recipe(
 async def _async_add_to_shopping_list(
     call: ServiceCall, data: EatFreshData
 ) -> ServiceResponse:
-    """Put the ingredients of a KitchenOwl recipe on the shopping list."""
-    added = await data.async_add_to_shopping_list([call.data[ATTR_RECIPE_ID]])
+    """Put the ingredients of a KitchenOwl recipe on the shopping list.
+
+    The amounts are scaled to ``servings`` (default: the start value).
+    """
+    added = await data.async_add_to_shopping_list(
+        [call.data[ATTR_RECIPE_ID]], call.data.get(ATTR_SERVINGS)
+    )
     return {"added": added}
 
 
@@ -198,14 +227,20 @@ async def _async_get_planner(call: ServiceCall, data: EatFreshData) -> ServiceRe
     start: date = call.data.get(ATTR_START_DATE) or today()
     days: int = call.data[ATTR_DAYS]
     entries = await data.async_current_planner_entries()
+    default = data.default_servings
     return {
         "start_date": start.isoformat(),
         "days": days,
         "entries": [
-            plan_item(day, entry) for day, entry in dated_entries(entries, start, days)
+            plan_item(day, entry, default)
+            for day, entry in dated_entries(entries, start, days)
         ],
         "unscheduled": [
-            {"recipe_id": entry["recipe_id"], "name": str(entry.get("name") or "")}
+            {
+                "recipe_id": entry["recipe_id"],
+                "name": str(entry.get("name") or ""),
+                "servings": entry_servings(entry, default),
+            }
             for entry in unscheduled_entries(entries)
         ],
     }
@@ -213,10 +248,10 @@ async def _async_get_planner(call: ServiceCall, data: EatFreshData) -> ServiceRe
 
 @_action
 async def _async_plan_recipe(call: ServiceCall, data: EatFreshData) -> ServiceResponse:
-    """Plan a recipe of the collection on a day."""
+    """Plan a recipe of the collection on a day (default: start servings)."""
     recipe_id: int = call.data[ATTR_RECIPE_ID]
     day: date = call.data[ATTR_DATE]
-    await data.async_planner_add(recipe_id, day)
+    await data.async_planner_add(recipe_id, day, call.data.get(ATTR_SERVINGS))
     return {"recipe_id": recipe_id, "date": day.isoformat()}
 
 

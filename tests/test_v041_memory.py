@@ -183,7 +183,7 @@ async def test_store_migrates_13_to_14(
     hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
     await hass.async_block_till_done()
     saved = hass_storage[STORAGE_KEY]
-    assert saved["minor_version"] == 4
+    assert saved["minor_version"] == 5  # 0.5.0
     for key, value in old.items():
         assert saved["data"][key] == value
     assert saved["data"]["ingredients"] == {"11": [row(1, "Mehl", "500 g")]}

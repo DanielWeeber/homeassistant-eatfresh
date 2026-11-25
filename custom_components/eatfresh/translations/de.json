@@ -54,15 +54,19 @@
     "step": {
       "init": {
         "title": "Rezeptquellen und Essensplan",
-        "description": "Wähle die Webseiten, in denen EatFresh sucht. „Rezept-Link einfügen“ geht immer. EatFresh ruft eine Seite nur ab, wenn du suchst oder ein Rezept öffnest.\n\nChefkoch ist standardmäßig aus. Die AGB von Chefkoch (Ziffer 5.1) schränken automatische Abrufe ein. Wenn du Chefkoch einschaltest, liegt die Nutzung in deiner eigenen Verantwortung.\n\nEatFresh holt den Essensplan aus KitchenOwl im unten eingestellten Abstand und nach jeder Änderung in EatFresh.",
+        "description": "Wähle die Webseiten, in denen EatFresh sucht. „Rezept-Link einfügen“ geht immer. EatFresh ruft eine Seite nur ab, wenn du suchst oder ein Rezept öffnest.\n\nChefkoch ist standardmäßig aus. Die AGB von Chefkoch (Ziffer 5.1) schränken automatische Abrufe ein. Wenn du Chefkoch einschaltest, liegt die Nutzung in deiner eigenen Verantwortung.\n\nEatFresh holt den Essensplan aus KitchenOwl im unten eingestellten Abstand und nach jeder Änderung in EatFresh.\n\nEin Rezept der Sammlung öffnet mit den unten eingestellten Standard-Portionen.\n\nEatFresh sortiert die Einkaufsliste nach Kategorien. Mit dem Schalter unten trägt es die Kategorie auch in KitchenOwl ein, bei Artikeln ohne Kategorie und wenn du einen Eintrag selbst verschiebst. Eine Kategorie, die ein Artikel schon hat, ändert EatFresh nie von selbst.",
         "data": {
           "sources": "Aktive Quellen",
           "accept_chefkoch_terms": "Ich kenne die AGB von Chefkoch (Ziffer 5.1) und nutze Chefkoch in eigener Verantwortung",
-          "planner_interval": "Abgleich des Essensplans (Minuten)"
+          "planner_interval": "Abgleich des Essensplans (Minuten)",
+          "default_servings": "Standard-Portionen",
+          "write_categories": "Kategorien in KitchenOwl eintragen"
         },
         "data_description": {
           "accept_chefkoch_terms": "Nur nötig, wenn Chefkoch ausgewählt ist.",
-          "planner_interval": "Wie oft EatFresh den Essensplan für Kalender, Sensor und Karten holt (1 bis 60 Minuten). Jeder Abgleich ist eine Anfrage an KitchenOwl."
+          "planner_interval": "Wie oft EatFresh den Essensplan für Kalender, Sensor und Karten holt (1 bis 60 Minuten). Jeder Abgleich ist eine Anfrage an KitchenOwl.",
+          "default_servings": "Mit so vielen Portionen öffnet ein Rezept der Sammlung. Zutaten und Einkaufsliste werden darauf umgerechnet.",
+          "write_categories": "Aus: EatFresh sortiert die Liste nur für sich und ändert in KitchenOwl keine Kategorie."
         }
       }
     },
@@ -88,6 +92,10 @@
         "recipe_id": {
           "name": "Rezept-ID",
           "description": "ID des Rezepts in KitchenOwl."
+        },
+        "servings": {
+          "name": "Portionen",
+          "description": "Anzahl Portionen (1 bis 99). Die Mengen werden darauf umgerechnet. Standard: der Startwert des Rezepts."
         }
       }
     },
@@ -134,6 +142,10 @@
         "date": {
           "name": "Tag",
           "description": "Tag, an dem das Rezept geplant wird."
+        },
+        "servings": {
+          "name": "Portionen",
+          "description": "Anzahl Portionen dieses Eintrags im Essensplan (1 bis 99). Standard: der Startwert des Rezepts."
         }
       }
     },
@@ -230,6 +242,24 @@
     },
     "picnic_maybe_sent": {
       "message": "Picnic hat nicht eindeutig geantwortet. Sieh in der Picnic-App nach."
+    },
+    "not_on_list": {
+      "message": "Der Eintrag steht nicht mehr auf der Einkaufsliste."
+    },
+    "not_done": {
+      "message": "Dieser Eintrag ist nicht unter „Erledigt“."
+    },
+    "item_gone": {
+      "message": "Den Artikel gibt es in KitchenOwl nicht mehr. Er bleibt unter „Erledigt“, bis die Zeit um ist."
+    },
+    "unknown_department": {
+      "message": "Diese Kategorie gibt es nicht."
+    },
+    "unscheduled_entry": {
+      "message": "Dieses Rezept steht zusätzlich ohne Tag im Wochenplan. KitchenOwl würde diesen Eintrag beim Ändern der Portionen entfernen. Plane das Rezept ohne Tag zuerst an einem Tag ein oder nimm es heraus."
+    },
+    "plan_entry_lost": {
+      "message": "Die Portionen ließen sich nicht ändern, und der Eintrag fehlt jetzt im Wochenplan. Plane das Rezept an diesem Tag bitte neu ein."
     }
   },
   "entity": {

@@ -69,7 +69,11 @@ async def test_add_recipe_to_shopping_list(
         return_response=True,
     )
     assert response == {"added": 3}
-    mock_client.add_recipe_to_shoppinglist.assert_awaited_once_with(2, 11)
+    # 0.5.0: the recipe is read first (its yields is the base); unknown
+    # yields here, so nothing is scaled.
+    mock_client.add_recipe_to_shoppinglist.assert_awaited_once_with(
+        2, 11, recipe={"id": 11, "name": "Soup"}, servings=None
+    )
 
 
 @pytest.mark.parametrize(

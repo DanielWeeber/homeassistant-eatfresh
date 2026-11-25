@@ -7,7 +7,7 @@ from typing import Final
 
 DOMAIN: Final = "eatfresh"
 NAME: Final = "EatFresh"
-VERSION: Final = "0.4.1"
+VERSION: Final = "0.5.0"
 
 REPOSITORY_URL: Final = "https://github.com/DanielWeeber/homeassistant-eatfresh"
 USER_AGENT: Final = f"EatFresh/{VERSION} (+{REPOSITORY_URL})"
@@ -24,6 +24,13 @@ CONF_ACCEPT_CHEFKOCH: Final = "accept_chefkoch_terms"
 # Minutes between two fetches of the meal plan. Entries of 0.2.0 have no
 # such option and use the default.
 CONF_PLANNER_INTERVAL: Final = "planner_interval"
+# Servings a recipe of the collection opens with (1 to 12, default 3).
+# Entries of 0.4.1 and earlier have no such option and use the default.
+CONF_DEFAULT_SERVINGS: Final = "default_servings"
+# Write categories to KitchenOwl (default on). Off: EatFresh sorts the list
+# only for itself and sends no request that changes a category.
+CONF_WRITE_CATEGORIES: Final = "write_categories"
+DEFAULT_WRITE_CATEGORIES: Final = True
 
 CHEFKOCH: Final = "chefkoch"
 JSONLD: Final = "jsonld"
@@ -33,7 +40,10 @@ STORAGE_VERSION: Final = 1
 # 1.1: EatFresh 0.1.0 (favorites). 1.2: EatFresh 0.2.0 adds hidden recipes.
 # 1.3: EatFresh 0.4.0 adds picnic_map, picnic_skip and picnic_sent.
 # 1.4: EatFresh 0.4.1 adds ingredients (remembered items of the recipes).
-STORAGE_MINOR_VERSION: Final = 4
+# 1.5: EatFresh 0.5.0 adds list_exact (exact pack counts of the list), the
+#      optional smaller Picnic product ("small") in picnic_map and picnic_sent,
+#      shop_done (entries ticked off) and shop_departments (own groups).
+STORAGE_MINOR_VERSION: Final = 5
 STORAGE_KEY: Final = "eatfresh.favorites"
 STORAGE_SAVE_DELAY: Final = 2
 
@@ -98,6 +108,7 @@ ATTR_QUERY: Final = "query"
 ATTR_START_DATE: Final = "start_date"
 ATTR_DAYS: Final = "days"
 ATTR_DATE: Final = "date"
+ATTR_SERVINGS: Final = "servings"
 MAX_QUERY_LENGTH: Final = 100
 ATTR_LIMIT: Final = "limit"
 ATTR_NAME_ONLY: Final = "name_only"
@@ -113,6 +124,18 @@ ERR_KITCHENOWL_AUTH: Final = "kitchenowl_auth"
 ERR_NOT_LOADED: Final = "not_loaded"
 ERR_PICNIC_UNAVAILABLE: Final = "picnic_unavailable"
 ERR_PICNIC_ERROR: Final = "picnic_error"
+# 0.5.0: the entry to tick off is not on the shopping list (any more).
+ERR_NOT_ON_LIST: Final = "not_on_list"
+# The item to put back is gone from KitchenOwl; nothing ticked off to put
+# back; a group of the shopping list that does not exist.
+ERR_ITEM_GONE: Final = "item_gone"
+ERR_NOT_DONE: Final = "not_done"
+ERR_UNKNOWN_DEPARTMENT: Final = "unknown_department"
+# Changing the servings of a meal plan entry is refused while the same
+# recipe is planned without a day as well; the entry got lost while its
+# servings were changed (removing worked, planning again twice not).
+ERR_UNSCHEDULED_ENTRY: Final = "unscheduled_entry"
+ERR_PLAN_ENTRY_LOST: Final = "plan_entry_lost"
 
 # Picnic
 # Ingredients with a remembered product, excluded ingredients and marks of
@@ -120,10 +143,28 @@ ERR_PICNIC_ERROR: Final = "picnic_error"
 MAX_PICNIC_MAP: Final = 500
 MAX_PICNIC_SKIP: Final = 500
 MAX_PICNIC_SENT: Final = 300
-# Marks of entries put into the cart are dropped after this.
-PICNIC_SENT_MAX_AGE: Final = timedelta(days=14)
+# Days an entry ticked off stays under "Done", and days after which an entry
+# surely in the Picnic cart is taken off the shopping list (0.5.0).
+DONE_DAYS: Final = 3
+# Marks of entries put into the cart live this long (0.5.0: 3 days, was 14).
+# A mark surely in the cart stays until its entry is off the list.
+PICNIC_SENT_MAX_AGE: Final = timedelta(days=DONE_DAYS)
 MAX_PICNIC_NAME_LENGTH: Final = 100
 MAX_PICNIC_QUERY_LENGTH: Final = 60
 MAX_PICNIC_SEND_ITEMS: Final = 60
 MAX_PICNIC_AMOUNT: Final = 20
 PICNIC_SEARCH_LIMIT: Final = 8
+# Smaller pack for the rest (0.5.0): pieces of it per entry, 0 for none.
+MAX_PICNIC_SMALL_AMOUNT: Final = 20
+# Longest rest and pack size the panel may pass to the search.
+MAX_PICNIC_REST_LENGTH: Final = 30
+# Remembered exact pack counts of list entries: at most this many, this long.
+MAX_LIST_EXACT: Final = 500
+LIST_EXACT_MAX_AGE: Final = timedelta(days=14)
+# Entries ticked off and own groups of ingredients kept at most (0.5.0).
+MAX_SHOP_DONE: Final = 300
+MAX_SHOP_DEPARTMENTS: Final = 500
+# Categories of the household are read again after this (or after a write).
+CATEGORY_CACHE_TTL: Final = timedelta(minutes=5)
+# Items whose category is written after one transfer, at most.
+MAX_CATEGORY_WRITES: Final = 40

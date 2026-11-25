@@ -152,10 +152,16 @@ async def test_list_shoppinglist_items(client, mock):
             {"id": 13, "name": "Pfeffer"},
         ],
     )
+    # 0.5.0: each row carries its category (None without one).
     assert await client.list_shoppinglist_items(5) == [
-        {"id": 11, "name": "Mehl", "description": "500g"},
-        {"id": 12, "name": "Eier", "description": ""},
-        {"id": 13, "name": "Pfeffer", "description": ""},
+        {
+            "id": 11,
+            "name": "Mehl",
+            "description": "500g",
+            "category": {"id": 2, "name": "Backen", "default_key": None},
+        },
+        {"id": 12, "name": "Eier", "description": "", "category": None},
+        {"id": 13, "name": "Pfeffer", "description": "", "category": None},
     ]
     # Read only: exactly one GET, no body, no other method.
     assert len(mock.requests) == 1
@@ -185,8 +191,8 @@ async def test_list_shoppinglist_items_skips_broken_rows(client, mock):
         ],
     )
     assert await client.list_shoppinglist_items(5) == [
-        {"id": 1, "name": "Milch", "description": "1L"},
-        {"id": 7, "name": "Nummer als Text", "description": ""},
+        {"id": 1, "name": "Milch", "description": "1L", "category": None},
+        {"id": 7, "name": "Nummer als Text", "description": "", "category": None},
     ]
 
 
@@ -678,10 +684,12 @@ async def test_list_planner_dates_and_no_day(client, mock):
             "junk",
         ],
     )
+    # 0.5.0: every entry also carries ``yields`` and ``base``.
+    none = {"yields": None, "base": None}
     assert await client.list_planner(1) == [
-        {"recipe_id": 7, "name": "R7", "photo": None, "date": None},
-        {"recipe_id": 8, "name": "R8", "photo": "p.jpg", "date": date(2026, 11, 20)},
-        {"recipe_id": 8, "name": "R8", "photo": None, "date": date(2026, 11, 22)},
+        {"recipe_id": 7, "name": "R7", "photo": None, "date": None, **none},
+        {"recipe_id": 8, "name": "R8", "photo": "p.jpg", "date": date(2026, 11, 20), **none},
+        {"recipe_id": 8, "name": "R8", "photo": None, "date": date(2026, 11, 22), **none},
     ]
 
 

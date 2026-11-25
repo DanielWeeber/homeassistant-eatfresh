@@ -24,6 +24,7 @@ from .test_websocket_picnic import (  # noqa: F401  (fixtures)
     fake_picnic,
     no_pause,
     send_items,
+    sent_items,
     shopping_list,
     ws,
 )
@@ -170,7 +171,7 @@ async def test_timeout_is_never_sent_twice_by_itself(
     # and a new try puts 3 more in on purpose, as the user asked. The run
     # reads the cart first, so the 3 there before are counted in.
     msg = await ws.call("eatfresh/picnic/send", items=send_items((101, "s1", 3)))
-    assert msg["result"]["sent"] == send_items((101, "s1", 3))
+    assert msg["result"]["sent"] == sent_items((101, "s1", 3))
     assert fake_picnic.client.cart == {"s1": 6}
 
 

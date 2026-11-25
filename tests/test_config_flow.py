@@ -207,6 +207,10 @@ async def test_options_default_and_save(
         CONF_ACCEPT_CHEFKOCH: False,
         # Not in the form input: the default of the form (one minute).
         "planner_interval": 1,
+        # 0.5.0: likewise the default servings (3).
+        "default_servings": 3,
+        # 0.5.0 (shopping): categories are written to KitchenOwl by default.
+        "write_categories": True,
     }
     await hass.async_block_till_done()
     assert set(init_integration.runtime_data.sources) == {"fakeb", "jsonld"}

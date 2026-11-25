@@ -264,11 +264,12 @@ async def test_get_planner_default(
         "start_date": "2026-11-18",
         "days": 7,
         "entries": [
-            {"date": "2026-11-18", "recipe_id": 11, "name": "Soup"},
-            {"date": "2026-11-18", "recipe_id": 16, "name": "Salad"},
-            {"date": "2026-11-24", "recipe_id": 13, "name": "Pasta"},
+            # 0.5.0: plan entries without yields and base have no servings.
+            {"date": "2026-11-18", "recipe_id": 11, "name": "Soup", "servings": None},
+            {"date": "2026-11-18", "recipe_id": 16, "name": "Salad", "servings": None},
+            {"date": "2026-11-24", "recipe_id": 13, "name": "Pasta", "servings": None},
         ],
-        "unscheduled": [{"recipe_id": 15, "name": "Someday"}],
+        "unscheduled": [{"recipe_id": 15, "name": "Someday", "servings": None}],
     }
 
 
@@ -329,19 +330,23 @@ async def test_plan_recipe_updates_entities_at_once(
 ) -> None:
     fetches = mock_client.list_planner.await_count
 
-    async def add(household_id: int, recipe_id: int, day: date) -> None:
+    async def add(
+        household_id: int, recipe_id: int, day: date, yields: int | None = None
+    ) -> None:
         mock_client.list_planner.return_value = plan((recipe_id, "Soup", day))
 
     mock_client.add_planner_entry.side_effect = add
     response = await call(hass, "plan_recipe", recipe_id="11", date="2026-11-18")
     assert response == {"recipe_id": 11, "date": "2026-11-18"}
-    mock_client.add_planner_entry.assert_awaited_once_with(1, 11, TODAY)
+    # 0.5.0: recipe 11 has yields 4, so the start value 3 is planned.
+    mock_client.add_planner_entry.assert_awaited_once_with(1, 11, TODAY, yields=3)
     assert mock_client.list_planner.await_count == fetches + 1
     await hass.async_block_till_done()
     state = hass.states.get(SENSOR)
     assert state.state == "Soup"
     assert state.attributes["week"] == [
-        {"date": "2026-11-18", "recipe_id": 11, "name": "Soup"}
+        # 0.5.0: the plan entry of the fake has no yields: no servings.
+        {"date": "2026-11-18", "recipe_id": 11, "name": "Soup", "servings": None}
     ]
     assert hass.states.get(CALENDAR).attributes["message"] == "Soup"
 
@@ -604,9 +609,10 @@ async def test_sensor_week(
     )
     await refresh(init_integration)
     assert hass.states.get(SENSOR).attributes["week"] == [
-        {"date": "2026-11-18", "recipe_id": 11, "name": "Soup"},
-        {"date": "2026-11-20", "recipe_id": 16, "name": "Salad"},
-        {"date": "2026-11-24", "recipe_id": 13, "name": "Pasta"},
+        # 0.5.0: plan entries without yields and base have no servings.
+        {"date": "2026-11-18", "recipe_id": 11, "name": "Soup", "servings": None},
+        {"date": "2026-11-20", "recipe_id": 16, "name": "Salad", "servings": None},
+        {"date": "2026-11-24", "recipe_id": 13, "name": "Pasta", "servings": None},
     ]
 
 

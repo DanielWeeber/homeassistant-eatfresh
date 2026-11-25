@@ -54,15 +54,19 @@
     "step": {
       "init": {
         "title": "Recipe sources and meal plan",
-        "description": "Choose the websites EatFresh searches. Pasting a recipe link always works. EatFresh only loads a page when you search or open a recipe.\n\nChefkoch is off by default. Its terms of use (section 5.1) restrict automated access. If you turn Chefkoch on, you use it at your own risk and responsibility.\n\nEatFresh fetches the KitchenOwl meal plan at the interval below and after every change made in EatFresh.",
+        "description": "Choose the websites EatFresh searches. Pasting a recipe link always works. EatFresh only loads a page when you search or open a recipe.\n\nChefkoch is off by default. Its terms of use (section 5.1) restrict automated access. If you turn Chefkoch on, you use it at your own risk and responsibility.\n\nEatFresh fetches the KitchenOwl meal plan at the interval below and after every change made in EatFresh.\n\nA recipe of the collection opens with the default servings below.\n\nEatFresh sorts the shopping list into categories. With the switch below it also writes the category into KitchenOwl, for items that have none and when you move an entry yourself. A category an item already has is never changed by itself.",
         "data": {
           "sources": "Active sources",
           "accept_chefkoch_terms": "I have read the Chefkoch terms (section 5.1) and use Chefkoch at my own responsibility",
-          "planner_interval": "Meal plan update interval (minutes)"
+          "planner_interval": "Meal plan update interval (minutes)",
+          "default_servings": "Default servings",
+          "write_categories": "Write categories to KitchenOwl"
         },
         "data_description": {
           "accept_chefkoch_terms": "Required only if Chefkoch is selected.",
-          "planner_interval": "How often EatFresh fetches the meal plan for the calendar, the sensor and the cards (1 to 60 minutes). Each fetch is one request to KitchenOwl."
+          "planner_interval": "How often EatFresh fetches the meal plan for the calendar, the sensor and the cards (1 to 60 minutes). Each fetch is one request to KitchenOwl.",
+          "default_servings": "A recipe of the collection opens with this many servings. Ingredients and the shopping list are scaled to it.",
+          "write_categories": "Off: EatFresh sorts the list only for itself and changes no category in KitchenOwl."
         }
       }
     },
@@ -88,6 +92,10 @@
         "recipe_id": {
           "name": "Recipe ID",
           "description": "ID of the recipe in KitchenOwl."
+        },
+        "servings": {
+          "name": "Servings",
+          "description": "Number of servings (1 to 99). The amounts are scaled to it. Default: the start value of the recipe."
         }
       }
     },
@@ -134,6 +142,10 @@
         "date": {
           "name": "Day",
           "description": "Day the recipe is planned on."
+        },
+        "servings": {
+          "name": "Servings",
+          "description": "Number of servings of this meal plan entry (1 to 99). Default: the start value of the recipe."
         }
       }
     },
@@ -230,6 +242,24 @@
     },
     "picnic_maybe_sent": {
       "message": "Picnic's answer was not clear. Check the Picnic app."
+    },
+    "not_on_list": {
+      "message": "The entry is no longer on the shopping list."
+    },
+    "not_done": {
+      "message": "This entry is not under “Done”."
+    },
+    "item_gone": {
+      "message": "The item no longer exists in KitchenOwl. It stays under “Done” until its time is up."
+    },
+    "unknown_department": {
+      "message": "This category does not exist."
+    },
+    "unscheduled_entry": {
+      "message": "This recipe is in the meal plan without a day as well. KitchenOwl would remove that entry when the servings change. Plan the recipe without a day on a day first, or take it out."
+    },
+    "plan_entry_lost": {
+      "message": "The servings could not be changed, and the entry is now missing from the meal plan. Please plan the recipe on this day again."
     }
   },
   "entity": {

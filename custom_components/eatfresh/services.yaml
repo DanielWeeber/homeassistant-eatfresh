@@ -16,6 +16,14 @@ add_recipe_to_shopping_list:
         number:
           min: 1
           mode: box
+    servings:
+      required: false
+      example: 3
+      selector:
+        number:
+          min: 1
+          max: 99
+          mode: box
 
 search_collection:
   fields:
@@ -70,6 +78,14 @@ plan_recipe:
       example: "2026-11-16"
       selector:
         date:
+    servings:
+      required: false
+      example: 3
+      selector:
+        number:
+          min: 1
+          max: 99
+          mode: box
 
 unplan_recipe:
   fields:

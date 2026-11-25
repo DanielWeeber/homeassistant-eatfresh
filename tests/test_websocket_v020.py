@@ -378,7 +378,10 @@ async def test_planner_add_and_remove_refresh(
     calls_before = mock_client.list_planner.await_count
     msg = await ws.call("eatfresh/planner/add", kitchenowl_id=11, date="2026-11-18")
     assert msg["result"] == {}
-    mock_client.add_planner_entry.assert_awaited_once_with(1, 11, date(2026, 11, 18))
+    # 0.5.0: recipe 11 has yields 4, so the start value 3 is planned.
+    mock_client.add_planner_entry.assert_awaited_once_with(
+        1, 11, date(2026, 11, 18), yields=3
+    )
     assert mock_client.list_planner.await_count == calls_before + 1
 
     msg = await ws.call("eatfresh/planner/remove", kitchenowl_id=11, date="2026-11-18")
@@ -424,11 +427,17 @@ async def test_planner_shopping_list(ws: WS, mock_client: MagicMock) -> None:
     result = msg["result"]
     assert (result["added"], result["recipes"]) == (11, 3)
     assert dt_util.parse_datetime(result["at"]) is not None
-    assert mock_client.add_recipe_to_shoppinglist.await_args_list == [
-        call(2, 11),
-        call(2, 12),
-        call(2, 11),
+    # 0.5.0: each recipe is read first and sent with its servings (the
+    # read recipe has no yields here, so nothing is scaled).
+    assert [c.args for c in mock_client.add_recipe_to_shoppinglist.await_args_list] == [
+        (2, 11),
+        (2, 12),
+        (2, 11),
     ]
+    assert all(
+        c.kwargs["servings"] is None
+        for c in mock_client.add_recipe_to_shoppinglist.await_args_list
+    )
 
 
 async def test_planner_shopping_list_empty_week(ws: WS, mock_client: MagicMock) -> None:

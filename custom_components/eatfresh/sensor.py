@@ -13,9 +13,12 @@ from homeassistant.helpers.event import async_track_time_change
 from .const import WEEK_DAYS
 from .entity import EatFreshEntity
 from .image_proxy import sign_photo
+from .portions import DEFAULT_SERVINGS
 from .runtime import (
     EatFreshConfigEntry,
     dated_entries,
+    default_servings,
+    entry_servings,
     plan_item,
     planner_date,
     today,
@@ -48,10 +51,12 @@ def todays_entries(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]
     ]
 
 
-def week_entries(entries: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Return ``{date, recipe_id, name}`` from today to six days on, by day."""
+def week_entries(
+    entries: list[dict[str, Any]] | None, default: int = DEFAULT_SERVINGS
+) -> list[dict[str, Any]]:
+    """Return ``{date, recipe_id, name, servings}`` from today to six days on."""
     return [
-        plan_item(day, entry)
+        plan_item(day, entry, default)
         for day, entry in dated_entries(entries, today(), WEEK_DAYS)
     ]
 
@@ -94,9 +99,10 @@ class EatFreshTodaySensor(EatFreshEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return today's recipes (id, name, image) and the plan of the week."""
+        """Return today's recipes (id, name, image, servings) and the week."""
+        default = default_servings(self.coordinator.config_entry.options)
         return {
-            "week": week_entries(self.coordinator.data),
+            "week": week_entries(self.coordinator.data, default),
             "recipes": [
                 {
                     "kitchenowl_id": entry["recipe_id"],
@@ -104,6 +110,7 @@ class EatFreshTodaySensor(EatFreshEntity, SensorEntity):
                     "image": sign_photo(
                         self.hass, entry.get("photo"), content_user=True
                     ),
+                    "servings": entry_servings(entry, default),
                 }
                 for entry in todays_entries(self.coordinator.data)
             ],
